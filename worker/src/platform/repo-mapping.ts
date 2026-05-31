@@ -92,3 +92,106 @@ function addCandidate(
 function cleanRepo(repo: string): string {
   return repo.replace(/\.git$/i, "").replace(/[),.\]]+$/g, "");
 }
+
+// --- Name-based project -> repo matching ----------------------------------
+// Now that the full github_repos list is synced, matching a Linear project to a
+// repo by name is far more reliable than scraping the project description.
+
+export type RepoLike = {
+  owner: string;
+  name: string;
+  url: string;
+  fullName: string;
+  archived?: number;
+  fork?: number;
+  pushedAt?: string | null;
+};
+
+export type ProjectMatch =
+  | { status: "mapped"; repo: RepoLike; confidence: number }
+  | { status: "needs_review"; repo: RepoLike; confidence: number }
+  | { status: "unmapped"; repo: null; confidence: 0 };
+
+// kebab-case a display name the way repos are typically named:
+// "Book Cook — Studio v2" -> "book-cook-studio-v2".
+export function slugifyName(name: string): string {
+  return name
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// Drop a trailing qualifier after a dash/colon separator surrounded by spaces:
+// "Book Cook — Studio v2" -> "Book Cook", "AI Dev Sidebar — Unified" -> "AI Dev Sidebar".
+function baseName(name: string): string {
+  const parts = name.split(/\s+[—–:-]\s+/);
+  return parts[0] ?? name;
+}
+
+function tokenSet(slug: string): Set<string> {
+  return new Set(slug.split("-").filter(Boolean));
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) {
+    if (b.has(t)) inter += 1;
+  }
+  return inter / (a.size + b.size - inter);
+}
+
+// Prefer a real, current repo when several candidates tie: non-archived,
+// non-fork, then most recently pushed.
+function pickBest(repos: RepoLike[]): RepoLike {
+  return [...repos].sort((l, r) => {
+    if ((l.archived ?? 0) !== (r.archived ?? 0)) return (l.archived ?? 0) - (r.archived ?? 0);
+    if ((l.fork ?? 0) !== (r.fork ?? 0)) return (l.fork ?? 0) - (r.fork ?? 0);
+    return (r.pushedAt ?? "").localeCompare(l.pushedAt ?? "");
+  })[0]!;
+}
+
+export function matchProjectToRepo(projectName: string, repos: RepoLike[]): ProjectMatch {
+  const full = slugifyName(projectName);
+  const base = slugifyName(baseName(projectName));
+  if (!full || repos.length === 0) {
+    return { status: "unmapped", repo: null, confidence: 0 };
+  }
+
+  const byName = (rn: string) => rn.toLowerCase();
+
+  // Tier 1 — exact slug match on the full name or the base name => auto-map.
+  const exact = repos.filter((r) => byName(r.name) === full || byName(r.name) === base);
+  if (exact.length > 0) {
+    return { status: "mapped", repo: pickBest(exact), confidence: 1 };
+  }
+
+  // Tier 2 — one name is a dash-delimited prefix of the other => suggest.
+  // ("fly-mail-evolution" ~ "fly-mail"; base "alex" -> repo "alex-chat")
+  const prefix = repos.filter((r) => {
+    const rn = byName(r.name);
+    return full.startsWith(`${rn}-`) || rn.startsWith(`${base}-`);
+  });
+  if (prefix.length > 0) {
+    return { status: "needs_review", repo: pickBest(prefix), confidence: 0.7 };
+  }
+
+  // Tier 3 — token overlap (Jaccard) >= 0.5 => suggest the strongest.
+  const fullTokens = tokenSet(full);
+  let best: RepoLike | null = null;
+  let bestScore = 0;
+  for (const r of repos) {
+    const score = jaccard(fullTokens, tokenSet(byName(r.name)));
+    if (score > bestScore) {
+      bestScore = score;
+      best = r;
+    }
+  }
+  if (best && bestScore >= 0.5) {
+    return { status: "needs_review", repo: best, confidence: bestScore };
+  }
+
+  return { status: "unmapped", repo: null, confidence: 0 };
+}

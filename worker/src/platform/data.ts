@@ -16,6 +16,7 @@ export type ProjectSummary = {
   repoMappingStatus: string;
   repoConfidence: number;
   repoUrl: string | null;
+  suggestedRepo: string | null;
   activeRuns: number;
   failedRuns: number;
 };
@@ -221,13 +222,16 @@ export async function getProjects(env: Env): Promise<ProjectSummary[]> {
        p.url,
        p.repo_mapping_status AS repoMappingStatus,
        p.repo_confidence AS repoConfidence,
-       rm.url AS repoUrl,
+       (SELECT url FROM repository_mappings
+          WHERE linear_project_id = p.id AND status = 'active' LIMIT 1) AS repoUrl,
+       (SELECT owner || '/' || repo FROM repository_mappings
+          WHERE linear_project_id = p.id AND status = 'suggested'
+          ORDER BY confidence DESC LIMIT 1) AS suggestedRepo,
        COALESCE(SUM(CASE WHEN r.status IN ('queued', 'waiting_approval', 'running') THEN 1 ELSE 0 END), 0) AS activeRuns,
        COALESCE(SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END), 0) AS failedRuns
      FROM linear_projects p
-     LEFT JOIN repository_mappings rm ON rm.linear_project_id = p.id AND rm.status = 'active'
      LEFT JOIN runs r ON r.project_id = p.id
-     GROUP BY p.id, rm.url
+     GROUP BY p.id
      ORDER BY activeRuns DESC, p.synced_at DESC
      LIMIT 50`,
   );
@@ -422,6 +426,7 @@ function demoProjects(): ProjectSummary[] {
       repoMappingStatus: "unmapped",
       repoConfidence: 0,
       repoUrl: null,
+      suggestedRepo: null,
       activeRuns: 0,
       failedRuns: 0,
     },
