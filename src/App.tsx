@@ -60,6 +60,7 @@ type Overview = {
     repoMappingStatus: string;
     repoConfidence: number;
     repoUrl: string | null;
+    suggestedRepo: string | null;
     activeRuns: number;
     failedRuns: number;
   }>;
@@ -266,6 +267,18 @@ export function App() {
     },
   });
 
+  // Auto-map all Linear projects to GitHub repos by name.
+  const autoMap = useMutation({
+    mutationFn: () =>
+      fetchJson<{ mapped: number; needsReview: number; unmapped: number }>(
+        "/api/projects/auto-map",
+        { method: "POST", headers: { "content-type": "application/json" } },
+      ),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+    },
+  });
+
   // Early return AFTER all hooks have run so hook order is stable across
   // authed vs unauthed renders. See react.dev/errors/300.
   if (overviewQuery.data && !overviewQuery.data.user) {
@@ -391,13 +404,27 @@ export function App() {
 
             <Card withBorder radius="md" padding={0}>
               <Box px="lg" py="sm" style={sectionHeader}>
-                <Title order={2} size="h4">
-                  Linear Projects
-                </Title>
+                <Group justify="space-between">
+                  <Title order={2} size="h4">
+                    Linear Projects
+                  </Title>
+                  <Button
+                    size="xs"
+                    variant="light"
+                    loading={autoMap.isPending}
+                    onClick={() => autoMap.mutate()}
+                  >
+                    Auto-map repos
+                  </Button>
+                </Group>
               </Box>
               <Stack gap={0}>
                 {projects.map((project) => (
-                  <ProjectRow key={project.id} project={project} />
+                  <ProjectRow
+                    key={project.id}
+                    project={project}
+                    repos={overview?.repos ?? []}
+                  />
                 ))}
                 {projects.length === 0 ? <EmptyRow label="No projects" /> : null}
               </Stack>
@@ -595,7 +622,14 @@ const PRIORITY_LABELS: Record<number, string> = {
   4: "Low",
 };
 
-function ProjectRow({ project }: { project: Overview["projects"][number] }) {
+function ProjectRow({
+  project,
+  repos,
+}: {
+  project: Overview["projects"][number];
+  repos: Overview["repos"];
+}) {
+  const queryClient = useQueryClient();
   const [expanded, setExpanded] = useState(false);
 
   // Open issues are fetched live (never stored) and only when the row is
@@ -610,6 +644,22 @@ function ProjectRow({ project }: { project: Overview["projects"][number] }) {
   });
 
   const issues = issuesQuery.data?.issues ?? [];
+
+  // Manual repo mapping: pick a synced repo (or clear). The current mapping is
+  // matched back to a repo id via its URL so the Select shows the active value.
+  const currentRepoId =
+    repos.find((repo) => repo.url === project.repoUrl)?.id ?? null;
+  const setMapping = useMutation({
+    mutationFn: (repoId: string | null) =>
+      fetchJson("/api/projects/" + project.id + "/mapping", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(repoId ? { repoId } : { clear: true }),
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+    },
+  });
 
   return (
     <Box style={rowBorder}>
@@ -645,6 +695,37 @@ function ProjectRow({ project }: { project: Overview["projects"][number] }) {
 
       {expanded ? (
         <Box px="lg" pb="sm" pl={32}>
+          <Group gap="xs" align="flex-end" pb="sm" wrap="nowrap">
+            <Select
+              label="GitHub repo"
+              placeholder={repos.length ? "Search repos…" : "Sync GitHub first"}
+              data={repos.map((repo) => ({ value: repo.id, label: repo.fullName }))}
+              value={currentRepoId}
+              onChange={(value) => setMapping.mutate(value)}
+              searchable
+              clearable
+              disabled={repos.length === 0 || setMapping.isPending}
+              size="xs"
+              style={{ flex: 1, minWidth: 0 }}
+              comboboxProps={{ withinPortal: true }}
+            />
+            {!currentRepoId && project.suggestedRepo ? (
+              <Button
+                size="xs"
+                variant="light"
+                loading={setMapping.isPending}
+                onClick={() => {
+                  const suggested = repos.find(
+                    (repo) => repo.fullName === project.suggestedRepo,
+                  );
+                  if (suggested) setMapping.mutate(suggested.id);
+                }}
+              >
+                Use {project.suggestedRepo}
+              </Button>
+            ) : null}
+          </Group>
+
           {issuesQuery.isLoading ? (
             <Group gap="xs" py="xs">
               <Loader size="xs" />

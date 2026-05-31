@@ -20,12 +20,15 @@ import {
   recordUsage,
 } from "./platform/data";
 import {
+  autoMapProjects,
   backfillGithubRepos,
   backfillLinearProjects,
+  clearProjectMapping,
   createOAuthConnectUrl,
   getDecryptedToken,
   getLinearProjectIssues,
   handleOAuthCallback,
+  setProjectMapping,
   storeWebhook,
   syncLinearProjectFromPayload,
   verifyWebhook,
@@ -443,6 +446,33 @@ app.get("/api/projects/:id/issues", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
   return c.json(await getLinearProjectIssues(c.env, user.id, c.req.param("id")));
+});
+
+// Auto-map all Linear projects to GitHub repos by name (confident matches become
+// active; weaker ones are suggested; manual mappings are preserved).
+app.post("/api/projects/auto-map", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return c.json(await autoMapProjects(c.env, user.id));
+});
+
+// Manually set or clear a project's GitHub repo mapping.
+// Body: { repoId: "gh_<id>" } to set, or { clear: true } to remove.
+app.post("/api/projects/:id/mapping", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const body = (await c.req.json().catch(() => null)) as
+    | { repoId?: string; clear?: boolean }
+    | null;
+  const projectId = c.req.param("id");
+  if (body?.clear) {
+    return c.json(await clearProjectMapping(c.env, projectId));
+  }
+  if (!body?.repoId) {
+    return c.json({ error: "repoId or clear is required" }, 400);
+  }
+  const result = await setProjectMapping(c.env, user.id, projectId, body.repoId);
+  return c.json(result, result.ok ? 200 : 404);
 });
 
 app.get("/api/runs/:id/events", async (c) => {

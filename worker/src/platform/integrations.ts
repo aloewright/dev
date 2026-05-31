@@ -4,8 +4,10 @@ import { decryptText, encryptText, hmacHex, timingSafeEqual } from "./crypto";
 import { all, first, id, runSql } from "./data";
 import {
   extractGitHubReposFromText,
+  matchProjectToRepo,
   repoMappingStatus,
   type RepoCandidate,
+  type RepoLike,
 } from "./repo-mapping";
 
 export type OAuthProvider = "github" | "linear";
@@ -467,6 +469,9 @@ export async function backfillLinearProjects(
     });
   }
 
+  // Map any newly-synced projects to repos by name. Best-effort.
+  await autoMapProjects(env, userId).catch(() => undefined);
+
   return { synced: nodes.length };
 }
 
@@ -577,6 +582,9 @@ export async function backfillGithubRepos(
     }
   }
 
+  // Re-run name-based mapping now that the repo list is fresh. Best-effort.
+  await autoMapProjects(env, userId).catch(() => undefined);
+
   return { synced };
 }
 
@@ -669,4 +677,138 @@ export async function getLinearProjectIssues(
   }));
 
   return { issues };
+}
+
+// --- Linear project <-> GitHub repo mapping --------------------------------
+
+async function loadUserRepos(env: Env, userId: string): Promise<RepoLike[]> {
+  return all<RepoLike & Record<string, unknown>>(
+    env,
+    `SELECT owner, name, full_name AS fullName, url, archived, fork, pushed_at AS pushedAt
+     FROM github_repos
+     WHERE user_id = ?`,
+    [userId],
+  );
+}
+
+async function writeMapping(
+  env: Env,
+  projectId: string,
+  repo: RepoLike,
+  confidence: number,
+  source: "auto" | "manual",
+  status: "active" | "suggested",
+): Promise<void> {
+  await runSql(
+    env,
+    `INSERT INTO repository_mappings
+       (id, linear_project_id, provider, owner, repo, url, confidence, source, status)
+     VALUES (?, ?, 'github', ?, ?, ?, ?, ?, ?)`,
+    [id("repo"), projectId, repo.owner, repo.name, repo.url, confidence, source, status],
+  );
+}
+
+async function setProjectMappingStatus(
+  env: Env,
+  projectId: string,
+  status: "mapped" | "needs_review" | "unmapped",
+  confidence: number,
+): Promise<void> {
+  await runSql(
+    env,
+    `UPDATE linear_projects SET repo_mapping_status = ?, repo_confidence = ? WHERE id = ?`,
+    [status, confidence, projectId],
+  );
+}
+
+// Auto-map every Linear project to a GitHub repo by name. Confident (exact slug)
+// matches become the active mapping; weaker matches are stored as 'suggested'
+// (surfaced for one-click confirmation); no match leaves the project unmapped.
+// Manual mappings are never overwritten. Idempotent: re-running recomputes all
+// non-manual mappings from the current repo list.
+export async function autoMapProjects(
+  env: Env,
+  userId: string,
+): Promise<{ mapped: number; needsReview: number; unmapped: number; reason?: string }> {
+  const repos = await loadUserRepos(env, userId);
+  if (repos.length === 0) {
+    return { mapped: 0, needsReview: 0, unmapped: 0, reason: "No GitHub repos synced — Sync GitHub first" };
+  }
+
+  const projects = await all<{ id: string; name: string }>(
+    env,
+    `SELECT id, name FROM linear_projects`,
+  );
+
+  let mapped = 0;
+  let needsReview = 0;
+  let unmapped = 0;
+
+  for (const project of projects) {
+    const manual = await first<{ id: string }>(
+      env,
+      `SELECT id FROM repository_mappings
+       WHERE linear_project_id = ? AND source = 'manual' AND status = 'active'
+       LIMIT 1`,
+      [project.id],
+    );
+    if (manual) {
+      mapped += 1;
+      continue;
+    }
+
+    // Recompute non-manual mappings from scratch so stale suggestions don't pile up.
+    await runSql(
+      env,
+      `DELETE FROM repository_mappings WHERE linear_project_id = ? AND source != 'manual'`,
+      [project.id],
+    );
+
+    const match = matchProjectToRepo(project.name, repos);
+    if (match.status === "mapped") {
+      await writeMapping(env, project.id, match.repo, match.confidence, "auto", "active");
+      await setProjectMappingStatus(env, project.id, "mapped", match.confidence);
+      mapped += 1;
+    } else if (match.status === "needs_review") {
+      await writeMapping(env, project.id, match.repo, match.confidence, "auto", "suggested");
+      await setProjectMappingStatus(env, project.id, "needs_review", match.confidence);
+      needsReview += 1;
+    } else {
+      await setProjectMappingStatus(env, project.id, "unmapped", 0);
+      unmapped += 1;
+    }
+  }
+
+  return { mapped, needsReview, unmapped };
+}
+
+// Manually set a project's repo from a synced github_repos id. Replaces any
+// existing mapping with an active, source='manual' one (protected from auto-map).
+export async function setProjectMapping(
+  env: Env,
+  userId: string,
+  projectId: string,
+  repoId: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  const repo = await first<RepoLike & Record<string, unknown>>(
+    env,
+    `SELECT owner, name, full_name AS fullName, url FROM github_repos WHERE id = ? AND user_id = ?`,
+    [repoId, userId],
+  );
+  if (!repo) {
+    return { ok: false, reason: "Repository not found" };
+  }
+  await runSql(env, `DELETE FROM repository_mappings WHERE linear_project_id = ?`, [projectId]);
+  await writeMapping(env, projectId, repo, 1, "manual", "active");
+  await setProjectMappingStatus(env, projectId, "mapped", 1);
+  return { ok: true };
+}
+
+export async function clearProjectMapping(
+  env: Env,
+  projectId: string,
+): Promise<{ ok: boolean }> {
+  await runSql(env, `DELETE FROM repository_mappings WHERE linear_project_id = ?`, [projectId]);
+  await setProjectMappingStatus(env, projectId, "unmapped", 0);
+  return { ok: true };
 }
