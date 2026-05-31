@@ -501,9 +501,12 @@ export async function backfillGithubRepos(
   env: Env,
   userId: string,
 ): Promise<{ synced: number; reason?: string }> {
-  const token = await getDecryptedToken(env, userId, "github");
+  // Prefer a configured PAT (sees ALL repos) over the GitHub App OAuth token
+  // (limited to installed repos). The PAT makes repo sync work even before the
+  // user connects GitHub via OAuth.
+  const token = env.GITHUB_PAT || (await getDecryptedToken(env, userId, "github"));
   if (!token) {
-    return { synced: 0, reason: "GitHub is not connected" };
+    return { synced: 0, reason: "Set GITHUB_PAT or connect GitHub" };
   }
 
   const perPage = 100;

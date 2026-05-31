@@ -79,6 +79,10 @@ export type Env = {
   GITHUB_CLIENT_SECRET?: string;
   GITHUB_WEBHOOK_SECRET?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  // Personal access token used to list ALL repos. The GitHub App OAuth token is
+  // limited to installed repos; a (fine-grained) PAT with repo access sees
+  // everything. When set, it is preferred for repo sync. Secret.
+  GITHUB_PAT?: string;
   LINEAR_CLIENT_ID?: string;
   LINEAR_CLIENT_SECRET?: string;
   LINEAR_WEBHOOK_SECRET?: string;
