@@ -54,6 +54,18 @@ import { redactSecrets } from "./platform/crypto";
 const app = new Hono<{ Bindings: Env; Variables: { user: CurrentUser | null } }>();
 
 app.use("*", async (c, next) => {
+  // With run_worker_first, every static sub-resource also hits this middleware.
+  // Skip the hub get-session round-trip for non-navigation sub-resources
+  // (script/style/font/image/etc) and the public assets path — they don't need a
+  // user, and a fetch-per-asset would hammer the hub. Page navigations, API, and
+  // agent calls still resolve the user.
+  const dest = c.req.header("sec-fetch-dest");
+  const isStaticSubresource =
+    dest != null && dest !== "document" && dest !== "empty";
+  if (isStaticSubresource) {
+    c.set("user", null);
+    return next();
+  }
   const user = await getCurrentUser(c.req.raw, c.env);
   c.set("user", user);
   await next();
@@ -716,20 +728,29 @@ app.get("*", async (c) => {
     return c.json({ error: "Not found" }, 404);
   }
 
-  // Static assets (JS/CSS/fonts) are public — serve them without an auth check so
-  // the login redirect itself can load. Only gate actual page navigations.
+  // Gate TOP-LEVEL PAGE NAVIGATIONS on the fly.pm universal-login hub: an
+  // unauthenticated (or non-@fly.pm) visitor is bounced to auth.fly.pm/login and
+  // returned here after signing in. This must run BEFORE serving any asset,
+  // because the assets binding serves index.html for "/" directly (which would
+  // otherwise leak the app shell). Static sub-resources (JS/CSS/fonts/images)
+  // are NOT navigations — they carry Sec-Fetch-Dest: script/style/font/image —
+  // so they stay public and the login page's own assets can load.
+  const dest = c.req.header("sec-fetch-dest");
+  const accept = c.req.header("accept") ?? "";
+  const isPageNavigation = dest === "document" || (dest == null && accept.includes("text/html"));
+  if (isPageNavigation && !c.get("user")) {
+    return c.redirect(hubLoginRedirect(c.req.raw, c.env), 302);
+  }
+
   const asset = await c.env.ASSETS.fetch(c.req.raw);
   if (asset.status !== 404) {
     return asset;
   }
 
-  // SPA page load: gate on the fly.pm universal-login hub. An unauthenticated
-  // (or non-@fly.pm) visitor is bounced to auth.fly.pm/login and returned here
-  // after signing in. This replaces the Cloudflare Access edge gate.
+  // SPA deep-link fallback (no matching asset) — also a navigation; gate it.
   if (!c.get("user")) {
     return c.redirect(hubLoginRedirect(c.req.raw, c.env), 302);
   }
-
   const indexUrl = new URL("/index.html", c.req.url);
   return c.env.ASSETS.fetch(new Request(indexUrl, c.req.raw));
 });

@@ -6,7 +6,12 @@
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "directory": "dist",
-    "binding": "ASSETS"
+    "binding": "ASSETS",
+    // Run the Worker BEFORE the assets layer so the auth gate fires on page
+    // navigations (otherwise "/" -> index.html is served by assets directly,
+    // bypassing the gate). The catch-all serves static sub-resources via the
+    // ASSETS binding after the gate check.
+    "run_worker_first": true
   },
   "routes": [
     {
@@ -14,6 +19,8 @@
       "custom_domain": true
     }
   ],
+  "workers_dev": false,
+  "preview_urls": false,
   "tail_consumers": [
     {
       "service": "fly-dev-tail"
