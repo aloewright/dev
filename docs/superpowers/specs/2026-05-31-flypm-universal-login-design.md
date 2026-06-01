@@ -29,6 +29,8 @@ This replaces the current state where dev.fly.pm is gated by Cloudflare Access (
 - Same `BETTER_AUTH_SECRET` (one shared secret across all unified workers — required so any app can validate a session token the hub signed).
 - Cookie `Domain=.fly.pm` (leading dot), default better-auth cookie prefix (`better-auth.session_token`), `Secure`, `SameSite=Lax`.
 
+**Cookie ownership (important):** the **hub is the only component that mints or sets auth cookies.** Consumer apps (dev.fly.pm and all later waves) NEVER call `setCookie`/run better-auth's cookie-setting paths — they only **read** the incoming `.fly.pm` cookie and **forward** it to the hub's `get-session`. This avoids two apps fighting over the same cookie and keeps the secret as the single trust anchor. (Consumer apps therefore do not need `crossSubDomainCookies` config; only the hub does.)
+
 ## 3. Architecture
 
 ```
