@@ -150,7 +150,6 @@
     "PLAYWRIGHT_WORKER_URL": "",
     "REQUIRE_HUMAN_APPROVAL": "true",
     "GITHUB_APP_ID": "3899646",
-    "CF_ACCESS_TEAM_DOMAIN": "worthy.cloudflareaccess.com",
-    "CF_ACCESS_AUD": "bfb63a75fcbabb5db5086b8ec9f2eba93db59c3fb9b3d502edfe057278725bee"
+    "AUTH_HUB_URL": "https://auth.fly.pm"
   }
 }

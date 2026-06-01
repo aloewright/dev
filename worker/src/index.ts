@@ -5,9 +5,9 @@ import { Hono } from "hono";
 import { DurableObject, WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { createAuth } from "./auth";
 import type { ContainerRunResult, CurrentUser, Env, RunWorkflowParams, WorkQueueMessage } from "./env";
 import { getCurrentUser, requireUser, verifyInternalRequest } from "./platform/auth-session";
+import { hubLoginRedirect } from "./platform/fly-auth";
 import {
   all,
   ensureUser,
@@ -694,25 +694,14 @@ app.post("/api/internal/summon", async (c) => {
   return createTaskRun(c.env, localUser, payload as CreateTaskPayload);
 });
 
-// Real sign-out. Login is via Cloudflare Access, so the session is the
-// CF_Authorization cookie, not a better-auth session — POSTing to
-// /api/auth/sign-out clears nothing the user is actually using. Redirect to the
-// Access logout endpoint, which clears the Access session cookie; Access then
-// re-challenges on the next request. Registered before the /api/auth/* mount and
-// the catch-all so neither shadows it.
+// Sign-out. Login lives entirely on the fly.pm hub (auth.fly.pm), which owns the
+// .fly.pm session cookie, so sign-out must happen there. Redirect to the hub's
+// /logout, which clears the cookie fleet-wide and bounces back to the login page.
+// The SPA's "Sign out" button navigates here. Kept at the legacy path so the
+// frontend needs no change this wave.
 app.get("/api/access-logout", (c) => {
-  const team = c.env.CF_ACCESS_TEAM_DOMAIN;
-  if (!team) {
-    return c.redirect("/", 302);
-  }
-  const url = new URL(`https://${team}/cdn-cgi/access/logout`);
-  url.searchParams.set("returnTo", c.env.APP_URL || new URL(c.req.url).origin);
-  return c.redirect(url.toString(), 302);
-});
-
-app.on(["GET", "POST"], "/api/auth/*", (c) => {
-  const auth = createAuth(c.env);
-  return auth.handler(c.req.raw);
+  const hub = c.env.AUTH_HUB_URL || "https://auth.fly.pm";
+  return c.redirect(`${hub}/logout`, 302);
 });
 
 app.all("/agents/orchestrator/:flyUserId", async (c) => {
@@ -727,9 +716,18 @@ app.get("*", async (c) => {
     return c.json({ error: "Not found" }, 404);
   }
 
+  // Static assets (JS/CSS/fonts) are public — serve them without an auth check so
+  // the login redirect itself can load. Only gate actual page navigations.
   const asset = await c.env.ASSETS.fetch(c.req.raw);
   if (asset.status !== 404) {
     return asset;
+  }
+
+  // SPA page load: gate on the fly.pm universal-login hub. An unauthenticated
+  // (or non-@fly.pm) visitor is bounced to auth.fly.pm/login and returned here
+  // after signing in. This replaces the Cloudflare Access edge gate.
+  if (!c.get("user")) {
+    return c.redirect(hubLoginRedirect(c.req.raw, c.env), 302);
   }
 
   const indexUrl = new URL("/index.html", c.req.url);
