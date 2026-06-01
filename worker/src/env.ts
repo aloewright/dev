@@ -71,10 +71,9 @@ export type Env = {
   BETTER_AUTH_SECRET?: string;
   TOKEN_ENCRYPTION_KEY?: string;
   INTERNAL_API_SECRET?: string;
-  // Cloudflare Access (Zero Trust) login. Non-secret identifiers; safe in vars.
-  CF_ACCESS_TEAM_DOMAIN?: string;
-  CF_ACCESS_AUD?: string;
-  LOGIN_ALLOWED_EMAILS?: string;
+  // fly.pm universal-login hub. Non-secret; safe in vars. dev.fly.pm forwards
+  // the session cookie here to validate (replaces Cloudflare Access).
+  AUTH_HUB_URL?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   GITHUB_WEBHOOK_SECRET?: string;

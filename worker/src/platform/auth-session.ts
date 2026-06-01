@@ -1,45 +1,28 @@
 /* AGPL-3.0-or-later */
-import { createAuth } from "../auth";
 import type { CurrentUser, Env } from "../env";
 import { ensureUser } from "./data";
-import { getCfAccessIdentity } from "./cf-access";
+import { getFlyAuthUser } from "./fly-auth";
 import { hmacHex, timingSafeEqual } from "./crypto";
-
-type BetterAuthSession = {
-  user?: {
-    id?: string;
-    email?: string | null;
-    name?: string | null;
-  };
-};
 
 const SIGNATURE_WINDOW_MS = 5 * 60 * 1000;
 
 export async function getCurrentUser(request: Request, env: Env): Promise<CurrentUser | null> {
-  // Primary login path: Cloudflare Access (Zero Trust) fronts dev.fly.pm and
-  // runs the entire login (One-time PIN / configured IdP). The edge forwards a
-  // signed JWT we verify here. The Access policy already restricts who can sign
-  // in; the email allowlist below is defense-in-depth in case the policy is ever
-  // loosened. See cf-access.ts and SANDBOX_REVIEW.md A1.
-  const cfAccess = await getCfAccessIdentity(request, env);
-  if (cfAccess) {
-    if (!isAllowedEmail(env, cfAccess.email)) {
-      return null;
-    }
+  // Primary login path: the fly.pm universal-login hub (auth.fly.pm). We forward
+  // the incoming `.fly.pm` session cookie to the hub's get-session and trust its
+  // answer. The hub already enforces @fly.pm-only; getFlyAuthUser re-checks the
+  // domain and fails closed if the hub is unreachable. See fly-auth.ts and the
+  // universal-login design doc.
+  const flyUser = await getFlyAuthUser(request, env);
+  if (flyUser) {
     return ensureUser(env, {
-      email: cfAccess.email,
-      name: cfAccess.name,
-      flyUserSlug: slugify(cfAccess.email) || `cf-${cfAccess.sub}`,
-      authSource: "cf-access",
+      email: flyUser.email,
+      name: flyUser.name,
+      flyUserSlug: `ba-${flyUser.id}`.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64),
+      authSource: "fly",
     });
   }
 
-  const betterAuthUser = await getBetterAuthUser(request, env);
-  if (betterAuthUser) {
-    return ensureUser(env, betterAuthUser);
-  }
-
-  // Trusted-proxy identity (e.g. fly.pm SSO). dev.fly.pm is a public custom
+  // Trusted-proxy identity (machine-to-machine). dev.fly.pm is a public custom
   // domain, so raw x-fly-* headers are forgeable. They are only honored when
   // accompanied by a valid HMAC signature from the trusted proxy (shared
   // INTERNAL_API_SECRET). See SANDBOX_REVIEW.md A1.
@@ -121,33 +104,6 @@ async function verifyFlyIdentity(
   };
 }
 
-async function getBetterAuthUser(request: Request, env: Env): Promise<Omit<CurrentUser, "id"> | null> {
-  try {
-    const auth = createAuth(env);
-    const session = (await auth.api.getSession({
-      headers: request.headers,
-    })) as BetterAuthSession | null;
-
-    if (!session?.user?.id) {
-      return null;
-    }
-
-    return {
-      email: session.user.email ?? null,
-      name: session.user.name ?? null,
-      // Key on the stable Better Auth user id to avoid slug collisions between
-      // different emails that normalize to the same value. See SANDBOX_REVIEW.md A5.
-      flyUserSlug: `ba-${session.user.id}`.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64),
-      authSource: "better-auth",
-    };
-  } catch (error) {
-    if (error instanceof Error && /no such table/i.test(error.message)) {
-      return null;
-    }
-    throw error;
-  }
-}
-
 function isFreshTimestamp(timestamp: string): boolean {
   const ts = Number(timestamp);
   return Number.isFinite(ts) && Math.abs(Date.now() - ts) <= SIGNATURE_WINDOW_MS;
@@ -156,20 +112,6 @@ function isFreshTimestamp(timestamp: string): boolean {
 function isLocalRequest(request: Request): boolean {
   const hostname = new URL(request.url).hostname;
   return hostname === "localhost" || hostname === "127.0.0.1";
-}
-
-// Comma-separated allowlist of emails permitted to sign in. When unset, we defer
-// entirely to the Cloudflare Access policy (which is itself scoped to the owner).
-function isAllowedEmail(env: Env, email: string): boolean {
-  const raw = env.LOGIN_ALLOWED_EMAILS;
-  if (!raw) {
-    return true;
-  }
-  const allow = raw
-    .split(",")
-    .map((entry) => entry.trim().toLowerCase())
-    .filter(Boolean);
-  return allow.length === 0 || allow.includes(email.toLowerCase());
 }
 
 function slugify(value: string): string {
