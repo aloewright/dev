@@ -405,6 +405,80 @@ export async function getDecryptedToken(
   return decryptText(row.access_token_encrypted, env.TOKEN_ENCRYPTION_KEY);
 }
 
+// Linear access tokens expire after 24h (Linear migrated to expiring tokens on
+// 2026-04-01). Return a usable token, refreshing via the stored rotating refresh
+// token when the current one is expired (or within 60s of it) and persisting the
+// rotated pair. Returns null and marks the connection 'expired' when refresh is
+// impossible — the caller should prompt the user to reconnect Linear.
+export async function getValidLinearToken(env: Env, userId: string): Promise<string | null> {
+  const row = await first<{
+    access_token_encrypted: string | null;
+    refresh_token_encrypted: string | null;
+    expires_at: string | null;
+  }>(
+    env,
+    `SELECT access_token_encrypted, refresh_token_encrypted, expires_at
+     FROM account_connections WHERE user_id = ? AND provider = 'linear' AND status = 'connected'`,
+    [userId],
+  );
+  if (!row?.access_token_encrypted) return null;
+
+  const expMs = row.expires_at ? Date.parse(row.expires_at) : NaN;
+  const expired = Number.isFinite(expMs) && expMs <= Date.now() + 60_000;
+  if (!expired) {
+    return decryptText(row.access_token_encrypted, env.TOKEN_ENCRYPTION_KEY);
+  }
+
+  if (!row.refresh_token_encrypted || !env.LINEAR_CLIENT_ID || !env.LINEAR_CLIENT_SECRET) {
+    console.warn("[linear] token expired and cannot refresh (missing refresh token or client creds)");
+    return null;
+  }
+  const refreshToken = await decryptText(row.refresh_token_encrypted, env.TOKEN_ENCRYPTION_KEY);
+  if (!refreshToken) {
+    console.warn("[linear] stored refresh token could not be decrypted");
+    return null;
+  }
+  const res = await fetch("https://api.linear.app/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: env.LINEAR_CLIENT_ID,
+      client_secret: env.LINEAR_CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    console.error(`[linear] refresh failed: HTTP ${res.status} ${body.slice(0, 300)}`);
+    await runSql(
+      env,
+      `UPDATE account_connections SET status = 'expired', updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND provider = 'linear'`,
+      [userId],
+    );
+    return null;
+  }
+  const token = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+  if (!token.access_token) {
+    console.error("[linear] refresh response missing access_token");
+    return null;
+  }
+  const newExpiresAt = token.expires_in
+    ? new Date(Date.now() + token.expires_in * 1000).toISOString()
+    : null;
+  const encAccess = await encryptText(token.access_token, env.TOKEN_ENCRYPTION_KEY);
+  // Refresh tokens rotate — store the new one (fall back to the old if absent).
+  const encRefresh = await encryptText(token.refresh_token ?? refreshToken, env.TOKEN_ENCRYPTION_KEY);
+  await runSql(
+    env,
+    `UPDATE account_connections SET access_token_encrypted = ?, refresh_token_encrypted = ?, expires_at = ?, status = 'connected', updated_at = CURRENT_TIMESTAMP
+     WHERE user_id = ? AND provider = 'linear'`,
+    [encAccess, encRefresh, newExpiresAt, userId],
+  );
+  console.log("[linear] access token refreshed");
+  return token.access_token;
+}
+
 export async function listKnownConnections(env: Env, userId: string) {
   return all(
     env,
@@ -434,7 +508,7 @@ export async function backfillLinearProjects(
   env: Env,
   userId: string,
 ): Promise<{ synced: number; reason?: string }> {
-  const token = await getDecryptedToken(env, userId, "linear");
+  const token = await getValidLinearToken(env, userId);
   if (!token) {
     return { synced: 0, reason: "Linear is not connected" };
   }
@@ -636,7 +710,7 @@ export async function getLinearProjectIssues(
   userId: string,
   projectId: string,
 ): Promise<{ issues: LinearIssue[]; reason?: string }> {
-  const token = await getDecryptedToken(env, userId, "linear");
+  const token = await getValidLinearToken(env, userId);
   if (!token) {
     return { issues: [], reason: "Linear is not connected" };
   }

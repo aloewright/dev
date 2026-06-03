@@ -26,7 +26,7 @@ import {
   backfillLinearProjects,
   clearProjectMapping,
   createOAuthConnectUrl,
-  getDecryptedToken,
+  getValidLinearToken,
   getLinearProjectIssues,
   handleOAuthCallback,
   setProjectMapping,
@@ -1024,7 +1024,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
 
     if (result.ok && linearIssueId) {
       await step.do("linear write-back", async () => {
-        const linearToken = await getDecryptedToken(this.env, plan.userId, "linear");
+        const linearToken = await getValidLinearToken(this.env, plan.userId);
         if (!linearToken) {
           await recordRunEvent(this.env, payload.runId, "linear.skipped", "No Linear token; skipping write-back.", "warn");
           return;

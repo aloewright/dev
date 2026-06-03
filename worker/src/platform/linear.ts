@@ -108,8 +108,17 @@ async function linearRequest<T = unknown>(
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ query, variables }),
   });
-  if (!res.ok) return null;
-  const json = (await res.json()) as { data?: T };
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    // Surface auth/API failures in observability (tail/logs) instead of swallowing
+    // them — a 401 here means the Linear token expired (see getValidLinearToken).
+    console.error(`[linear] GraphQL HTTP ${res.status}: ${body.slice(0, 300)}`);
+    return null;
+  }
+  const json = (await res.json()) as { data?: T; errors?: unknown };
+  if (json.errors) {
+    console.error(`[linear] GraphQL errors: ${JSON.stringify(json.errors).slice(0, 400)}`);
+  }
   return json.data ?? null;
 }
 

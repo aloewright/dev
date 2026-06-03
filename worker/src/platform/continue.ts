@@ -1,7 +1,7 @@
 /* AGPL-3.0-or-later */
 import type { CurrentUser, Env } from "../env";
 import { first } from "./data";
-import { autoMapProjects, getDecryptedToken, getLinearProjectIssues } from "./integrations";
+import { autoMapProjects, getLinearProjectIssues, getValidLinearToken } from "./integrations";
 import { planNextSteps, type ProjectContext } from "./planner";
 import { createLinearIssue, resolveProjectTeam, type CreatedLinearIssue } from "./linear";
 import { createAutonomousRun } from "./orchestration";
@@ -63,9 +63,12 @@ export async function continueProject(env: Env, user: CurrentUser, projectId: st
     );
   }
 
-  const linearToken = await getDecryptedToken(env, user.id, "linear");
+  const linearToken = await getValidLinearToken(env, user.id);
   if (!linearToken) {
-    return Response.json({ error: "Linear is not connected" }, { status: 400 });
+    return Response.json(
+      { error: "Linear session expired — reconnect Linear in Connections.", needsReconnect: true },
+      { status: 400 },
+    );
   }
 
   // The Linear token was validated just above, so getLinearProjectIssues won't
