@@ -48,6 +48,7 @@ describe("reclaimUserData", () => {
       expect(call.binds).toContain("user_canon");
     }
     expect(calls.some((c) => /UPDATE github_repos/.test(c.sql))).toBe(true);
+    expect(calls.some((c) => /DELETE FROM github_repos/.test(c.sql))).toBe(true);
     expect(calls.some((c) => /DELETE FROM account_connections/.test(c.sql))).toBe(true);
   });
 
