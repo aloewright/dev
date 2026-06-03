@@ -82,6 +82,7 @@ import {
 } from "./platform/reaper-policy";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
+import { runProjectWatcher } from "./platform/project-watcher";
 
 const app = new Hono<{ Bindings: Env; Variables: { user: CurrentUser | null } }>();
 
@@ -1653,12 +1654,15 @@ export default {
 
   // Self-healing reaper (cron). Re-queues runs that failed with a transient/
   // recoverable error or got stuck mid-flight, so nothing simply sits in `failed`.
-  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     await reapStuckRuns(env);
     await releaseOrphanedApprovals(env);
     await retryNoChangeStragglers(env);
     await reapMergeablePRs(env);
     await reflectMemoryBanks(env);
+    // Autonomous Linear project watcher (cherry-picked from spec/auth-worker-integrations).
+    // Fire-and-forget so the slow Linear+GitHub fan-out never blocks the reaper above.
+    ctx.waitUntil(runProjectWatcher(env));
   },
 };
 
