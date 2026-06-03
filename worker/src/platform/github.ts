@@ -119,6 +119,31 @@ async function combinedChecksState(
   return pending ? "pending" : "success";
 }
 
+// Search GitHub for a merged PR that references issueIdentifier (e.g. "FLY-42")
+// in its title or body. Uses the App installation token if available, falls back
+// to GITHUB_PAT. Returns false on any error so callers treat failure as "not found".
+export async function findMergedPrForIssue(
+  env: Env,
+  owner: string,
+  repo: string,
+  issueIdentifier: string,
+): Promise<boolean> {
+  try {
+    const token =
+      (await getInstallationToken(env, owner, repo)) ?? env.GITHUB_PAT ?? null;
+    if (!token) return false;
+
+    const q = `repo:${owner}/${repo} is:pr is:merged ${issueIdentifier} in:title,body`;
+    const url = `https://api.github.com/search/issues?q=${encodeURIComponent(q)}`;
+    const resp = await fetch(url, { headers: ghHeaders(token) });
+    if (!resp.ok) return false;
+    const data = (await resp.json()) as { total_count?: number };
+    return (data.total_count ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
 function ghHeaders(bearer: string): Record<string, string> {
   return {
     authorization: `Bearer ${bearer}`,
