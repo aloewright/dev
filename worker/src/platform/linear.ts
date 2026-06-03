@@ -35,15 +35,34 @@ export async function writeBackToLinear(token: string, input: LinearWriteBack): 
 
 export type CreatedLinearIssue = { id: string; identifier: string; url: string; title: string };
 
-// Resolve the first team owning a project. Linear issues require a teamId; a
-// project can span teams, so we take the first (sufficient for issue creation).
-export async function resolveProjectTeam(token: string, projectId: string): Promise<string | null> {
+// Resolve a team for creating issues in a project. Tries three sources in order:
+// 1. project.teams — works for team-scoped projects.
+// 2. issueTeamIds — team IDs scraped from the project's existing issues (workspace-
+//    level projects have no project.teams but their issues always belong to a team).
+// 3. viewer's first team — last resort so issue creation never fails on workspace setups.
+export async function resolveProjectTeam(
+  token: string,
+  projectId: string,
+  issueTeamIds: string[] = [],
+): Promise<string | null> {
   const data = await linearRequest<{ project?: { teams?: { nodes?: Array<{ id: string }> } } }>(
     token,
     PROJECT_TEAM_QUERY,
     { id: projectId },
   );
-  return data?.project?.teams?.nodes?.[0]?.id ?? null;
+  const fromProject = data?.project?.teams?.nodes?.[0]?.id ?? null;
+  if (fromProject) return fromProject;
+
+  const fromIssues = issueTeamIds.find(Boolean) ?? null;
+  if (fromIssues) return fromIssues;
+
+  // Last resort: viewer's first team.
+  const viewer = await linearRequest<{ teams?: { nodes?: Array<{ id: string }> } }>(
+    token,
+    `{ teams(first: 1) { nodes { id } } }`,
+    {},
+  );
+  return viewer?.teams?.nodes?.[0]?.id ?? null;
 }
 
 // Create a Linear issue under a project + team. Returns null when the mutation
@@ -89,8 +108,17 @@ async function linearRequest<T = unknown>(
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ query, variables }),
   });
-  if (!res.ok) return null;
-  const json = (await res.json()) as { data?: T };
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    // Surface auth/API failures in observability (tail/logs) instead of swallowing
+    // them — a 401 here means the Linear token expired (see getValidLinearToken).
+    console.error(`[linear] GraphQL HTTP ${res.status}: ${body.slice(0, 300)}`);
+    return null;
+  }
+  const json = (await res.json()) as { data?: T; errors?: unknown };
+  if (json.errors) {
+    console.error(`[linear] GraphQL errors: ${JSON.stringify(json.errors).slice(0, 400)}`);
+  }
   return json.data ?? null;
 }
 
