@@ -256,13 +256,15 @@ export function App() {
   // otherwise only populate via webhooks or not at all). Refetches overview so
   // the synced items appear immediately. Keyed by provider so each Connections
   // row shows its own loading state.
+  const [syncResult, setSyncResult] = useState<{ provider: Provider; synced: number; reason?: string } | null>(null);
   const sync = useMutation({
     mutationFn: (provider: Provider) =>
-      fetchJson<{ synced: number }>(`/api/integrations/${provider}/sync`, {
+      fetchJson<{ synced: number; reason?: string }>(`/api/integrations/${provider}/sync`, {
         method: "POST",
         headers: { "content-type": "application/json" },
       }),
-    onSuccess: () => {
+    onSuccess: (data, provider) => {
+      setSyncResult({ provider, synced: data.synced, reason: data.reason });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
   });
@@ -470,9 +472,17 @@ export function App() {
           <Stack gap="lg">
             <Card withBorder radius="md" padding={0}>
               <Box px="lg" py="sm" style={sectionHeader}>
-                <Title order={2} size="h4">
-                  Connections
-                </Title>
+                <Group justify="space-between">
+                  <Title order={2} size="h4">
+                    Connections
+                  </Title>
+                  {syncResult ? (
+                    <Text size="xs" c={syncResult.reason ? "orange" : "teal"}>
+                      {syncResult.provider}: {syncResult.synced} synced
+                      {syncResult.reason ? ` · ${syncResult.reason}` : ""}
+                    </Text>
+                  ) : null}
+                </Group>
               </Box>
               <Stack gap={0}>
                 {PROVIDERS.map((provider) => {
