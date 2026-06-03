@@ -123,6 +123,13 @@ type LinearIssue = {
   updatedAt: string | null;
 };
 
+type ContinueResult = {
+  summary: string;
+  createdIssues: Array<{ id: string; identifier: string; url: string; title: string }>;
+  queuedRuns: Array<{ id: string; issue: string }>;
+  skipped: number;
+};
+
 const PROVIDERS: Array<{ id: Provider; label: string }> = [
   { id: "github", label: "GitHub" },
   { id: "linear", label: "Linear" },
@@ -438,17 +445,49 @@ export function App() {
                   <Title order={2} size="h4">
                     GitHub Repos
                   </Title>
-                  <Text size="xs" c="dimmed">
-                    {(overview?.repos ?? []).length}
-                  </Text>
+                  <Group gap="xs">
+                    <Text size="xs" c="dimmed">
+                      {(overview?.repos ?? []).length}
+                    </Text>
+                    <Button
+                      size="xs"
+                      variant="light"
+                      loading={sync.isPending && sync.variables === "github"}
+                      onClick={() => sync.mutate("github")}
+                    >
+                      Sync repos
+                    </Button>
+                  </Group>
                 </Group>
+                {sync.data && sync.variables === "github" ? (
+                  <Text size="xs" c={sync.data.reason ? "red" : "dimmed"} mt={4}>
+                    {sync.data.reason ?? `Synced ${sync.data.synced} repos`}
+                  </Text>
+                ) : null}
+                {sync.error && sync.variables === "github" ? (
+                  <Text size="xs" c="red" mt={4}>
+                    {(sync.error as Error).message}
+                  </Text>
+                ) : null}
               </Box>
               <Stack gap={0}>
                 {(overview?.repos ?? []).map((repo) => (
                   <RepoRow key={repo.id} repo={repo} />
                 ))}
                 {(overview?.repos ?? []).length === 0 ? (
-                  <EmptyRow label="No repos synced — connect GitHub or hit Sync" />
+                  <Box px="lg" py="xl">
+                    <Text c="dimmed" size="sm" mb="sm">
+                      No repos synced yet.
+                    </Text>
+                    <Button
+                      size="xs"
+                      variant="light"
+                      loading={sync.isPending && sync.variables === "github"}
+                      onClick={() => sync.mutate("github")}
+                    >
+                      Sync repos now
+                    </Button>
+                  </Box>
                 ) : null}
               </Stack>
             </Card>
@@ -671,6 +710,20 @@ function ProjectRow({
     },
   });
 
+  const [confirming, setConfirming] = useState(false);
+  const continueMutation = useMutation({
+    mutationFn: () =>
+      fetchJson<ContinueResult>(`/api/projects/${project.id}/continue`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+    onSuccess: () => {
+      setConfirming(false);
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+      void queryClient.invalidateQueries({ queryKey: ["issues", project.id] });
+    },
+  });
+
   return (
     <Box style={rowBorder}>
       <Group
@@ -735,6 +788,59 @@ function ProjectRow({
               </Button>
             ) : null}
           </Group>
+
+          <Group gap="xs" align="center" pb="xs" wrap="wrap">
+            {confirming ? (
+              <>
+                <Text size="xs" c="dimmed">
+                  Creates Linear issues and starts runs.
+                </Text>
+                <Button
+                  size="xs"
+                  color="teal"
+                  loading={continueMutation.isPending}
+                  onClick={() => continueMutation.mutate()}
+                >
+                  Confirm
+                </Button>
+                <Button size="xs" variant="subtle" onClick={() => setConfirming(false)}>
+                  Cancel
+                </Button>
+              </>
+            ) : (
+              <Button size="xs" onClick={() => setConfirming(true)}>
+                Continue ▶
+              </Button>
+            )}
+          </Group>
+
+          {continueMutation.error ? (
+            <Text size="xs" c="red" pb="xs">
+              {(continueMutation.error as Error).message}
+            </Text>
+          ) : null}
+
+          {continueMutation.data ? (
+            <Stack gap={4} pb="xs">
+              {continueMutation.data.summary ? (
+                <Text size="xs" c="dimmed">
+                  {continueMutation.data.summary}
+                </Text>
+              ) : null}
+              {continueMutation.data.createdIssues.map((iss) => (
+                <Anchor key={iss.id} href={iss.url} target="_blank" size="xs" truncate>
+                  <Text component="span" size="xs" c="dimmed" mr={6}>
+                    {iss.identifier}
+                  </Text>
+                  {iss.title}
+                </Anchor>
+              ))}
+              <Text size="xs" c="dimmed">
+                {continueMutation.data.queuedRuns.length} run(s) started ·{" "}
+                {continueMutation.data.skipped} issue(s) queued
+              </Text>
+            </Stack>
+          ) : null}
 
           {issuesQuery.isLoading ? (
             <Group gap="xs" py="xs">
