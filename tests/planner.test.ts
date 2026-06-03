@@ -38,6 +38,14 @@ describe("extractJsonPlan", () => {
     expect(extractJsonPlan(null)).toBeNull();
     expect(extractJsonPlan(JSON.stringify({ summary: "x", issues: [] }))).toBeNull();
   });
+
+  it("handles braces inside string values", () => {
+    const raw =
+      '{"summary":"step {A} -> {B}","issues":[{"title":"t","description":"","priority":1}],"execute":[]}';
+    const plan = extractJsonPlan(raw);
+    expect(plan?.summary).toBe("step {A} -> {B}");
+    expect(plan?.issues).toHaveLength(1);
+  });
 });
 
 describe("planNextSteps", () => {
