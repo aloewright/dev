@@ -7,6 +7,7 @@ import { createLinearIssue, resolveProjectTeam, type CreatedLinearIssue } from "
 import { createAutonomousRun } from "./orchestration";
 
 const DEFAULT_EXECUTE_CAP = 3;
+const MAX_EXECUTE_CAP = 10; // hard ceiling so a misconfigured env var can't start a flood of runs
 
 export type CreatedWithMeta = {
   planIndex: number;
@@ -67,6 +68,9 @@ export async function continueProject(env: Env, user: CurrentUser, projectId: st
     return Response.json({ error: "Linear is not connected" }, { status: 400 });
   }
 
+  // The Linear token was validated just above, so getLinearProjectIssues won't
+  // return a "not connected" reason here; on a transient GraphQL error it yields an
+  // empty list and the planner simply proceeds with no open-issue context.
   const { issues: openIssues } = await getLinearProjectIssues(env, user.id, projectId);
 
   // 2. Plan.
@@ -96,7 +100,7 @@ export async function continueProject(env: Env, user: CurrentUser, projectId: st
   const created: CreatedWithMeta[] = [];
   for (let planIndex = 0; planIndex < plan.issues.length; planIndex += 1) {
     const planned = plan.issues[planIndex];
-    if (!planned) continue;
+    if (!planned) continue; // noUncheckedIndexedAccess narrowing; never null at runtime
     const issue = await createLinearIssue(linearToken, {
       teamId,
       projectId,
@@ -128,7 +132,7 @@ export async function continueProject(env: Env, user: CurrentUser, projectId: st
     summary: plan.summary,
     createdIssues: created.map((c) => c.issue),
     queuedRuns,
-    skipped: Math.max(0, created.length - queuedRuns.length),
+    skipped: Math.max(0, created.length - targets.length),
   } satisfies ContinueResult);
 }
 
@@ -142,5 +146,6 @@ async function activeRepo(env: Env, projectId: string): Promise<{ owner: string;
 
 function executeCap(env: Env): number {
   const n = Number.parseInt(env.CONTINUE_EXECUTE_CAP ?? "", 10);
-  return Number.isInteger(n) && n > 0 ? n : DEFAULT_EXECUTE_CAP;
+  const cap = Number.isInteger(n) && n > 0 ? n : DEFAULT_EXECUTE_CAP;
+  return Math.min(cap, MAX_EXECUTE_CAP);
 }
