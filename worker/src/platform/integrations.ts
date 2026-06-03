@@ -625,6 +625,7 @@ export type LinearIssue = {
   priority: number;
   assignee: string | null;
   updatedAt: string | null;
+  teamId: string | null;
 };
 
 // Live-fetch the OPEN issues for a single Linear project (state types backlog /
@@ -663,6 +664,7 @@ export async function getLinearProjectIssues(
               updatedAt
               state { name type }
               assignee { displayName }
+              team { id }
             }
           }
         }
@@ -684,6 +686,7 @@ export async function getLinearProjectIssues(
             updatedAt: string | null;
             state?: { name?: string; type?: string } | null;
             assignee?: { displayName?: string } | null;
+            team?: { id?: string } | null;
           }>;
         };
       };
@@ -701,6 +704,7 @@ export async function getLinearProjectIssues(
     priority: node.priority ?? 0,
     assignee: node.assignee?.displayName ?? null,
     updatedAt: node.updatedAt ?? null,
+    teamId: node.team?.id ?? null,
   }));
 
   return { issues };
