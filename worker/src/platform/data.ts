@@ -256,7 +256,7 @@ export async function getGithubRepos(env: Env, userId: string): Promise<GithubRe
      FROM github_repos
      WHERE user_id = ?
      ORDER BY pushed_at DESC
-     LIMIT 100`,
+     LIMIT 500`,
     [userId],
   );
 }

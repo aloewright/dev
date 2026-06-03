@@ -496,7 +496,9 @@ type GithubRepoNode = {
 // Pull every repository the connected GitHub account can see and upsert it into
 // github_repos. Mirrors backfillLinearProjects: GitHub has no webhook that emits
 // the full repo list, so this is how the dashboard gets a complete view.
-// Paginates the user-repos endpoint (sorted by recent push) up to a sane cap.
+// Paginates /user/repos first, then explicitly enumerates org repos — the
+// /user/repos endpoint misses org repos when the org has third-party OAuth app
+// restrictions, so the org-level pass acts as a fallback (best-effort per org).
 export async function backfillGithubRepos(
   env: Env,
   userId: string,
@@ -509,79 +511,57 @@ export async function backfillGithubRepos(
     return { synced: 0, reason: "Set GITHUB_PAT or connect GitHub" };
   }
 
+  const ghHeaders = {
+    authorization: `Bearer ${token}`,
+    accept: "application/vnd.github+json",
+    "user-agent": "fly-dev",
+    "x-github-api-version": "2022-11-28",
+  };
   const perPage = 100;
-  const maxPages = 10; // up to 1000 repos
   let synced = 0;
 
-  for (let page = 1; page <= maxPages; page += 1) {
+  // Pass 1: /user/repos — personal + collaborator + org repos the OAuth app can see.
+  for (let page = 1; page <= 10; page += 1) {
     const response = await fetch(
       `https://api.github.com/user/repos?per_page=${perPage}&page=${page}&sort=pushed&affiliation=owner,collaborator,organization_member`,
-      {
-        headers: {
-          authorization: `Bearer ${token}`,
-          accept: "application/vnd.github+json",
-          "user-agent": "fly-dev",
-          "x-github-api-version": "2022-11-28",
-        },
-      },
+      { headers: ghHeaders },
     );
     if (!response.ok) {
-      // Surface partial progress rather than throwing mid-pagination.
       return { synced, reason: `GitHub API returned ${response.status}` };
     }
-
     const repos = (await response.json()) as GithubRepoNode[];
-    if (!Array.isArray(repos) || repos.length === 0) {
-      break;
-    }
-
+    if (!Array.isArray(repos) || repos.length === 0) break;
     for (const repo of repos) {
-      await runSql(
-        env,
-        `INSERT INTO github_repos
-           (id, user_id, github_id, owner, name, full_name, url, description, private, fork, archived, default_branch, open_issues, stars, language, pushed_at, updated_at, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-         ON CONFLICT(user_id, github_id) DO UPDATE SET
-           owner = excluded.owner,
-           name = excluded.name,
-           full_name = excluded.full_name,
-           url = excluded.url,
-           description = excluded.description,
-           private = excluded.private,
-           fork = excluded.fork,
-           archived = excluded.archived,
-           default_branch = excluded.default_branch,
-           open_issues = excluded.open_issues,
-           stars = excluded.stars,
-           language = excluded.language,
-           pushed_at = excluded.pushed_at,
-           updated_at = excluded.updated_at,
-           synced_at = CURRENT_TIMESTAMP`,
-        [
-          `gh_${repo.id}`,
-          userId,
-          repo.id,
-          repo.owner?.login ?? "",
-          repo.name,
-          repo.full_name,
-          repo.html_url,
-          repo.description,
-          repo.private ? 1 : 0,
-          repo.fork ? 1 : 0,
-          repo.archived ? 1 : 0,
-          repo.default_branch,
-          repo.open_issues_count ?? 0,
-          repo.stargazers_count ?? 0,
-          repo.language,
-          repo.pushed_at,
-          repo.updated_at,
-        ],
-      );
+      await upsertGithubRepo(env, userId, repo);
       synced += 1;
     }
+    if (repos.length < perPage) break;
+  }
 
-    if (repos.length < perPage) {
-      break;
+  // Pass 2: /user/orgs → /orgs/{org}/repos — catches repos in orgs that have
+  // third-party OAuth restrictions (the /user/repos endpoint silently skips them).
+  // Best-effort: skip orgs that return non-200 (restriction not approved for this app).
+  const orgsResponse = await fetch(
+    `https://api.github.com/user/orgs?per_page=100`,
+    { headers: ghHeaders },
+  ).catch(() => null);
+  if (orgsResponse?.ok) {
+    const orgs = (await orgsResponse.json()) as Array<{ login: string }>;
+    for (const org of orgs) {
+      for (let page = 1; page <= 10; page += 1) {
+        const orgResp = await fetch(
+          `https://api.github.com/orgs/${org.login}/repos?per_page=${perPage}&page=${page}&sort=pushed&type=all`,
+          { headers: ghHeaders },
+        ).catch(() => null);
+        if (!orgResp?.ok) break; // org has restrictions or access denied — skip
+        const orgRepos = (await orgResp.json()) as GithubRepoNode[];
+        if (!Array.isArray(orgRepos) || orgRepos.length === 0) break;
+        for (const repo of orgRepos) {
+          await upsertGithubRepo(env, userId, repo);
+          synced += 1;
+        }
+        if (orgRepos.length < perPage) break;
+      }
     }
   }
 
@@ -589,6 +569,50 @@ export async function backfillGithubRepos(
   await autoMapProjects(env, userId).catch(() => undefined);
 
   return { synced };
+}
+
+async function upsertGithubRepo(env: Env, userId: string, repo: GithubRepoNode): Promise<void> {
+  await runSql(
+    env,
+    `INSERT INTO github_repos
+       (id, user_id, github_id, owner, name, full_name, url, description, private, fork, archived, default_branch, open_issues, stars, language, pushed_at, updated_at, synced_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(user_id, github_id) DO UPDATE SET
+       owner = excluded.owner,
+       name = excluded.name,
+       full_name = excluded.full_name,
+       url = excluded.url,
+       description = excluded.description,
+       private = excluded.private,
+       fork = excluded.fork,
+       archived = excluded.archived,
+       default_branch = excluded.default_branch,
+       open_issues = excluded.open_issues,
+       stars = excluded.stars,
+       language = excluded.language,
+       pushed_at = excluded.pushed_at,
+       updated_at = excluded.updated_at,
+       synced_at = CURRENT_TIMESTAMP`,
+    [
+      `gh_${repo.id}`,
+      userId,
+      repo.id,
+      repo.owner?.login ?? "",
+      repo.name,
+      repo.full_name,
+      repo.html_url,
+      repo.description,
+      repo.private ? 1 : 0,
+      repo.fork ? 1 : 0,
+      repo.archived ? 1 : 0,
+      repo.default_branch,
+      repo.open_issues_count ?? 0,
+      repo.stargazers_count ?? 0,
+      repo.language,
+      repo.pushed_at,
+      repo.updated_at,
+    ],
+  );
 }
 
 export type LinearIssue = {
