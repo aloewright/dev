@@ -145,4 +145,16 @@ describe("shouldDispatchIssue", () => {
       ),
     ).toBe("skip");
   });
+
+  it("skips a started issue at exactly 1h (boundary — not yet 4h)", () => {
+    const firstSeenStartedAt = new Date(NOW_MS - ONE_HOUR_MS).toISOString();
+    expect(
+      shouldDispatchIssue(
+        { state_type: "started", first_seen_started_at: firstSeenStartedAt },
+        false,
+        false,
+        NOW_MS,
+      ),
+    ).toBe("skip");
+  });
 });

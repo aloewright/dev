@@ -50,12 +50,17 @@ export function shouldDispatchIssue(
 export async function runProjectWatcher(env: Env): Promise<void> {
   try {
     // Enforce global concurrency cap to avoid overwhelming the container fleet.
-    const cap = await first<{ cnt: number }>(
-      env,
-      "SELECT COUNT(*) as cnt FROM runs WHERE status IN ('queued', 'running', 'waiting_approval')",
-      [],
-    );
-    if ((cap?.cnt ?? 0) >= MAX_CONCURRENT_RUNS) {
+    // Re-checked before each dispatch so a burst of eligible issues in one tick
+    // cannot push active runs past MAX_CONCURRENT_RUNS.
+    const activeRunCount = async (): Promise<number> => {
+      const row = await first<{ cnt: number }>(
+        env,
+        "SELECT COUNT(*) as cnt FROM runs WHERE status IN ('queued', 'running', 'waiting_approval')",
+        [],
+      );
+      return row?.cnt ?? 0;
+    };
+    if ((await activeRunCount()) >= MAX_CONCURRENT_RUNS) {
       console.log("[watcher] concurrency cap reached, skipping tick");
       return;
     }
@@ -91,7 +96,7 @@ export async function runProjectWatcher(env: Env): Promise<void> {
 
     for (const project of projects) {
       try {
-        await watchProject(env, userId, project.id, internalUser);
+        await watchProject(env, userId, project.id, internalUser, activeRunCount);
       } catch (err) {
         console.warn(`[watcher] project ${project.id} failed:`, err);
       }
@@ -106,9 +111,12 @@ async function watchProject(
   userId: string,
   projectId: string,
   internalUser: Awaited<ReturnType<typeof ensureUser>>,
+  activeRunCount: () => Promise<number>,
 ): Promise<void> {
   const { issues, reason } = await getLinearProjectIssues(env, userId, projectId);
-  if (reason || issues.length === 0) return;
+  // Return early only when the Linear token is missing. An empty issues list is
+  // valid (all done) and must still trigger the reconciliation pass below.
+  if (reason) return;
 
   const now = new Date().toISOString();
   const returnedIds = new Set(issues.map((i) => i.id));
@@ -125,6 +133,7 @@ async function watchProject(
        ON CONFLICT(issue_id) DO UPDATE SET
          state_type    = excluded.state_type,
          title         = excluded.title,
+         description   = excluded.description,
          team_id       = COALESCE(excluded.team_id, team_id),
          last_checked_at = excluded.last_checked_at,
          updated_at    = excluded.updated_at,
@@ -140,7 +149,7 @@ async function watchProject(
         issue.teamId ?? null,
         issue.identifier,
         issue.title,
-        null,
+        issue.description ?? null,
         issue.stateType,
         now,
         now,
@@ -216,6 +225,13 @@ async function watchProject(
       continue;
     }
     if (decision !== "dispatch") continue;
+
+    // Re-check cap immediately before dispatching — a previous iteration in this
+    // tick may have already pushed us to the limit.
+    if ((await activeRunCount()) >= MAX_CONCURRENT_RUNS) {
+      console.log("[watcher] concurrency cap reached mid-tick, deferring remaining issues");
+      break;
+    }
 
     const resp = await createTaskRun(env, internalUser, {
       objective: `${row.title}${row.description ? `\n\n${row.description}` : ""}`.trim(),

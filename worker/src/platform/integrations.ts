@@ -693,6 +693,7 @@ export type LinearIssue = {
   id: string;
   identifier: string;
   title: string;
+  description: string | null;
   url: string;
   state: string;
   stateType: string;
@@ -733,6 +734,7 @@ export async function getLinearProjectIssues(
               id
               identifier
               title
+              description
               url
               priority
               updatedAt
@@ -755,6 +757,7 @@ export async function getLinearProjectIssues(
             id: string;
             identifier: string;
             title: string;
+            description?: string | null;
             url: string;
             priority: number | null;
             updatedAt: string | null;
@@ -772,6 +775,7 @@ export async function getLinearProjectIssues(
     id: node.id,
     identifier: node.identifier,
     title: node.title,
+    description: node.description ?? null,
     url: node.url,
     state: node.state?.name ?? "Unknown",
     stateType: node.state?.type ?? "unknown",
