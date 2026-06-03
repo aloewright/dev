@@ -33,6 +33,42 @@ export async function writeBackToLinear(token: string, input: LinearWriteBack): 
   }
 }
 
+export type CreatedLinearIssue = { id: string; identifier: string; url: string; title: string };
+
+// Resolve the first team owning a project. Linear issues require a teamId; a
+// project can span teams, so we take the first (sufficient for issue creation).
+export async function resolveProjectTeam(token: string, projectId: string): Promise<string | null> {
+  const data = await linearRequest<{ project?: { teams?: { nodes?: Array<{ id: string }> } } }>(
+    token,
+    PROJECT_TEAM_QUERY,
+    { id: projectId },
+  );
+  return data?.project?.teams?.nodes?.[0]?.id ?? null;
+}
+
+// Create a Linear issue under a project + team. Returns null when the mutation
+// does not report success.
+export async function createLinearIssue(
+  token: string,
+  input: { teamId: string; projectId: string; title: string; description: string; priority: number },
+): Promise<CreatedLinearIssue | null> {
+  const data = await linearRequest<{
+    issueCreate?: {
+      success: boolean;
+      issue?: { id: string; identifier: string; url: string; title: string } | null;
+    };
+  }>(token, ISSUE_CREATE_MUTATION, {
+    teamId: input.teamId,
+    projectId: input.projectId,
+    title: input.title,
+    description: input.description,
+    priority: input.priority,
+  });
+  const issue = data?.issueCreate?.issue;
+  if (!data?.issueCreate?.success || !issue) return null;
+  return { id: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title };
+}
+
 async function resolveDoneState(token: string, teamId: string | null): Promise<string | null> {
   if (!teamId) return null;
   const data = await linearRequest<{ workflowStates?: { nodes?: Array<{ id: string }> } }>(
@@ -66,3 +102,7 @@ const ISSUE_STATE_MUTATION =
   `mutation($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: { stateId: $stateId }) { success } }`;
 const DONE_STATE_QUERY =
   `query($teamId: String!) { workflowStates(filter: { team: { id: { eq: $teamId } }, type: { eq: "completed" } }) { nodes { id name } } }`;
+const PROJECT_TEAM_QUERY =
+  `query($id: String!) { project(id: $id) { teams(first: 1) { nodes { id } } } }`;
+const ISSUE_CREATE_MUTATION =
+  `mutation($teamId: String!, $projectId: String!, $title: String!, $description: String!, $priority: Int!) { issueCreate(input: { teamId: $teamId, projectId: $projectId, title: $title, description: $description, priority: $priority }) { success issue { id identifier url title } } }`;
