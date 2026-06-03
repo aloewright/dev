@@ -125,7 +125,9 @@ export async function continueProject(env: Env, user: CurrentUser, projectId: st
       agentProvider: "claude-code",
       source: "continue",
     }).catch(() => null);
-    if (run) queuedRuns.push({ id: run.id, issue: target.issue.identifier });
+    // Only count runs that actually queued. With CONTINUE_AUTONOMY off, the run is
+    // left waiting_approval (not started), so it must not be reported as a started run.
+    if (run && run.status === "queued") queuedRuns.push({ id: run.id, issue: target.issue.identifier });
   }
 
   return Response.json({

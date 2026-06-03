@@ -33,21 +33,28 @@ const PLANNER_SYSTEM =
 
 export async function planNextSteps(env: Env, ctx: ProjectContext): Promise<NextStepPlan | null> {
   const gatewayId = env.AI_GATEWAY_ID || "x";
-  const raw = await (
-    env.AI as unknown as {
-      run: (m: string, i: unknown, o: { gateway: { id: string } }) => Promise<unknown>;
-    }
-  ).run(
-    PLANNER_MODEL,
-    {
-      messages: [
-        { role: "system", content: PLANNER_SYSTEM },
-        { role: "user", content: buildPlannerPrompt(ctx) },
-      ],
-      max_tokens: PLANNER_MAX_TOKENS,
-    },
-    { gateway: { id: gatewayId } },
-  );
+  let raw: unknown;
+  try {
+    raw = await (
+      env.AI as unknown as {
+        run: (m: string, i: unknown, o: { gateway: { id: string } }) => Promise<unknown>;
+      }
+    ).run(
+      PLANNER_MODEL,
+      {
+        messages: [
+          { role: "system", content: PLANNER_SYSTEM },
+          { role: "user", content: buildPlannerPrompt(ctx) },
+        ],
+        max_tokens: PLANNER_MAX_TOKENS,
+      },
+      { gateway: { id: gatewayId } },
+    );
+  } catch {
+    // AI gateway error/timeout — treat as "no usable plan" so the caller returns a
+    // clean 502 instead of a bare 500.
+    return null;
+  }
   return extractJsonPlan(readContent(raw));
 }
 
