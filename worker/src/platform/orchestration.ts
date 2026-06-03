@@ -373,3 +373,29 @@ async function resolveRepoCoords(
   if (!row) return null;
   return { owner: row.owner, repo: row.repo, url: row.url, baseBranch: "main" };
 }
+
+// Create a run and, when CONTINUE_AUTONOMY is enabled, immediately approve it so it
+// queues without a human checkpoint — bypassing REQUIRE_HUMAN_APPROVAL for the
+// operator-opted-in Continue flow. Reuses createTaskRun (creation + redaction +
+// usage) and approveRun (queue transition + approval audit row) so there is one
+// code path for run creation. When autonomy is off, the run is left
+// waiting_approval like any other.
+export async function createAutonomousRun(
+  env: Env,
+  user: CurrentUser,
+  payload: CreateTaskPayload,
+): Promise<{ id: string; status: string }> {
+  const response = await createTaskRun(env, user, {
+    ...payload,
+    autonomyMode: payload.autonomyMode ?? "auto_eligible",
+  });
+  const body = (await response.json()) as { id?: string; status?: string; error?: string };
+  if (!body.id) {
+    throw new Error(body.error ?? "Failed to create run");
+  }
+  if (env.CONTINUE_AUTONOMY === "true" && body.status === "waiting_approval") {
+    await approveRun(env, user, body.id);
+    return { id: body.id, status: "queued" };
+  }
+  return { id: body.id, status: body.status ?? "unknown" };
+}

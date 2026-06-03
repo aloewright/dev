@@ -12,7 +12,14 @@ export async function fetchJson<T>(input: RequestInfo | URL, init?: RequestInit)
   const response = await fetch(input, { ...init, headers });
 
   if (!response.ok) {
-    throw new Error(`Request failed with ${response.status}`);
+    let detail = `Request failed with ${response.status}`;
+    try {
+      const body = (await response.clone().json()) as { error?: string };
+      if (body?.error) detail = body.error;
+    } catch {
+      // non-JSON body — keep the status-based default
+    }
+    throw new Error(detail);
   }
 
   return (await response.json()) as T;

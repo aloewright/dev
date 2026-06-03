@@ -157,6 +157,8 @@
     "PLAYWRIGHT_WORKER_URL": "",
     "REQUIRE_HUMAN_APPROVAL": "true",
     "GITHUB_APP_ID": "3899646",
-    "AUTH_HUB_URL": "https://auth.fly.pm"
+    "AUTH_HUB_URL": "https://auth.fly.pm",
+    "CONTINUE_AUTONOMY": "true",
+    "CONTINUE_EXECUTE_CAP": "3"
   }
 }

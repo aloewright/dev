@@ -445,3 +445,64 @@ function demoUsage(): UsageSummary {
     costMicros: 0,
   };
 }
+
+// One-time, idempotent reconciliation: fold every OTHER user's user-scoped rows
+// into `intoUserId`. The Wave 1 auth migration minted a new app_users row for the
+// same human, orphaning repos/runs/usage under the old id (see the 2026-06-02
+// spec). Re-pointable tables are UPDATEd; account_connections cannot be re-pointed
+// (UNIQUE(user_id, provider)) so legacy duplicates are deleted (the canonical user
+// keeps its own). github_repos has UNIQUE(user_id, github_id) so orphaned duplicates
+// are deleted first before re-pointing (see repointGithubRepos). Idempotent: a second
+// run matches no rows. Single-operator tool — this collapses all identities into one;
+// do not use as-is for true multi-tenancy.
+export async function reclaimUserData(
+  env: Env,
+  intoUserId: string,
+): Promise<{ repos: number; runs: number; usage: number; memories: number; connectionsDropped: number }> {
+  const repos = await repointGithubRepos(env, intoUserId);
+  const runs = await repointUser(env, "runs", intoUserId);
+  const usage = await repointUser(env, "usage_events", intoUserId);
+  const memories = await repointUser(env, "agent_memories", intoUserId);
+  const dropped = await env.DB.prepare(
+    "DELETE FROM account_connections WHERE user_id != ?",
+  )
+    .bind(intoUserId)
+    .run();
+  return {
+    repos,
+    runs,
+    usage,
+    memories,
+    connectionsDropped: dropped.meta.changes ?? 0,
+  };
+}
+
+// github_repos has UNIQUE(user_id, github_id), so a blind re-point collides when the
+// canonical user already synced the same repo. Drop orphaned duplicates first (the
+// canonical copy wins — repos are re-syncable), then re-point the rest. Idempotent.
+async function repointGithubRepos(env: Env, intoUserId: string): Promise<number> {
+  await env.DB.prepare(
+    `DELETE FROM github_repos
+     WHERE user_id != ?
+       AND github_id IN (SELECT github_id FROM github_repos WHERE user_id = ?)`,
+  )
+    .bind(intoUserId, intoUserId)
+    .run();
+  const res = await env.DB.prepare(
+    `UPDATE github_repos SET user_id = ? WHERE user_id != ?`,
+  )
+    .bind(intoUserId, intoUserId)
+    .run();
+  return res.meta.changes ?? 0;
+}
+
+// `table` is from a fixed internal allowlist (never user input) so interpolation
+// is safe here.
+async function repointUser(env: Env, table: string, intoUserId: string): Promise<number> {
+  const res = await env.DB.prepare(
+    `UPDATE ${table} SET user_id = ? WHERE user_id != ?`,
+  )
+    .bind(intoUserId, intoUserId)
+    .run();
+  return res.meta.changes ?? 0;
+}
