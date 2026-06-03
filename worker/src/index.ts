@@ -18,6 +18,7 @@ import {
   id,
   recordRunEvent,
   recordUsage,
+  reclaimUserData,
 } from "./platform/data";
 import {
   autoMapProjects,
@@ -48,6 +49,7 @@ import {
   type CreateTaskPayload,
 } from "./platform/orchestration";
 import { writeBackToLinear } from "./platform/linear";
+import { continueProject } from "./platform/continue";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
 
@@ -95,7 +97,27 @@ app.get("/api/me", async (c) => {
 });
 
 app.get("/api/overview", async (c) => {
-  return c.json(await getOverview(c.env, c.get("user")));
+  const user = c.get("user");
+  const overview = await getOverview(c.env, user);
+  // Self-heal: if an authed user has zero repos but a sync is possible (PAT set or
+  // GitHub connected), kick off a one-shot backfill in the background. Guarded by a
+  // per-user KV flag so it runs at most once an hour and never blocks the response.
+  // Without this, an identity change (see the repos-fix spec) leaves repos empty
+  // with no obvious recovery. Repos appear on the next refresh.
+  if (user && overview.repos.length === 0) {
+    const githubConnected = overview.connections.some(
+      (conn) => conn.provider === "github" && conn.status === "connected",
+    );
+    if (c.env.GITHUB_PAT || githubConnected) {
+      const flagKey = `repos-autosync:${user.id}`;
+      const alreadyTried = await c.env.CACHE.get(flagKey);
+      if (!alreadyTried) {
+        await c.env.CACHE.put(flagKey, "1", { expirationTtl: 3600 });
+        c.executionCtx.waitUntil(backfillGithubRepos(c.env, user.id).catch(() => undefined));
+      }
+    }
+  }
+  return c.json(overview);
 });
 
 app.get("/api/usage", async (c) => {
@@ -460,6 +482,14 @@ app.get("/api/projects/:id/issues", async (c) => {
   return c.json(await getLinearProjectIssues(c.env, user.id, c.req.param("id")));
 });
 
+// Autonomous "Continue": review the project, plan next steps, create Linear issues,
+// and (when CONTINUE_AUTONOMY is on) start runs. See platform/continue.ts.
+app.post("/api/projects/:id/continue", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return continueProject(c.env, user, c.req.param("id"));
+});
+
 // Auto-map all Linear projects to GitHub repos by name (confident matches become
 // active; weaker ones are suggested; manual mappings are preserved).
 app.post("/api/projects/auto-map", async (c) => {
@@ -704,6 +734,22 @@ app.post("/api/internal/summon", async (c) => {
       authSource: "internal",
     }));
   return createTaskRun(c.env, localUser, payload as CreateTaskPayload);
+});
+
+// One-time, idempotent reconciliation of orphaned user-scoped data into a single
+// canonical user (see the 2026-06-02 repos-fix spec). HMAC-gated like other
+// internal routes.
+app.post("/api/internal/reclaim", async (c) => {
+  if (!(await verifyInternalRequest(c.req.raw, c.env))) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  const body = (await c.req.json().catch(() => null)) as { intoUserId?: string } | null;
+  if (!body?.intoUserId) {
+    return c.json({ error: "intoUserId is required" }, 400);
+  }
+  const counts = await reclaimUserData(c.env, body.intoUserId);
+  const mapped = await autoMapProjects(c.env, body.intoUserId).catch(() => null);
+  return c.json({ ok: true, ...counts, mapped });
 });
 
 // Sign-out. Login lives entirely on the fly.pm hub (auth.fly.pm), which owns the
