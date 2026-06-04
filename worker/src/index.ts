@@ -873,7 +873,10 @@ export class UserWorkerController extends DurableObject<Env> {
 export class SandboxContainer extends Container<Env> {
   defaultPort = 8080;
   requiredPorts = [8080];
-  sleepAfter = "10m";
+  // Must exceed the full run duration (up to the 90-min agent timeout + clone/
+  // test/push/PR). At 10m the container slept mid-agent-run and SIGTERM'd Claude
+  // (exit 143). Idle containers still sleep — just not during a long agent run.
+  sleepAfter = "120m";
   envVars = {
     NODE_ENV: "production",
     FLY_DEV_SANDBOX: "true",
