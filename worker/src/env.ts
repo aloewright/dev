@@ -38,6 +38,8 @@ export type ContainerRunResult = {
   summary?: string | null;
   logs?: string | null;
   error?: string | null;
+  // Agent subprocess exit code (non-zero = the agent itself errored, e.g. auth).
+  agentExitCode?: number | null;
   // Test gate (set when changes were produced and a test harness was detected).
   testsRun?: boolean | null;
   testsPassed?: boolean | null;

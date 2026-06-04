@@ -1013,6 +1013,10 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
           testExitCode: result.testExitCode ?? null,
           projectType: result.projectType ?? null,
           logs: result.logs ? redactSecrets(result.logs).slice(-4000) : null,
+          // The agent's own stdout — what Claude actually said/did. Essential for
+          // diagnosing no_changes / agent_error runs.
+          summary: result.summary ? redactSecrets(result.summary).slice(-4000) : null,
+          agentExitCode: result.agentExitCode ?? null,
         },
       );
       await recordUsage(this.env, payload.userId, "container_runtime", {
@@ -1119,6 +1123,7 @@ const RETRYABLE_ERRORS = [
   "pr_failed",
   "commit_failed",
   "no_github_token",
+  "agent_error",
   "Container /run returned",
   "exception",
   "Agent produced no changes",

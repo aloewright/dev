@@ -46,6 +46,9 @@ function exec(cmd, args, opts = {}) {
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...(opts.env ?? {}) },
+      // Detach stdin (→ /dev/null) so CLIs like `claude` don't block 3s waiting for
+      // piped input; the prompt is passed as an argument, not via stdin.
+      stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
@@ -288,8 +291,18 @@ async function handleRun(rawBody) {
 
     const status = await exec("git", ["status", "--porcelain"], { cwd: repoDir });
     if (!status.stdout.trim()) {
-      step(job.runId, "no_changes");
-      return { ok: false, error: "no_changes", summary, logs };
+      // No diff. Distinguish a genuine no-op (agent exited 0) from an agent failure
+      // (non-zero exit — e.g. expired Claude OAuth token, crash). The latter is
+      // retryable and worth surfacing distinctly.
+      const errored = agent.code !== 0;
+      step(job.runId, errored ? "agent_error" : "no_changes", { exitCode: agent.code });
+      return {
+        ok: false,
+        error: errored ? "agent_error" : "no_changes",
+        agentExitCode: agent.code,
+        summary,
+        logs,
+      };
     }
     step(job.runId, "changes:detected");
 
