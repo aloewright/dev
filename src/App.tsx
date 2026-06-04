@@ -940,6 +940,24 @@ function RepoRow({ repo }: { repo: Overview["repos"][number] }) {
 }
 
 function RunRow({ run }: { run: Overview["recentRuns"][number] }) {
+  const queryClient = useQueryClient();
+  const approve = useMutation({
+    mutationFn: () =>
+      fetchJson(`/api/runs/${run.id}/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["overview"] }),
+  });
+  const cancel = useMutation({
+    mutationFn: () =>
+      fetchJson(`/api/runs/${run.id}/cancel`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["overview"] }),
+  });
+  const waiting = run.status === "waiting_approval";
   return (
     <Group justify="space-between" px="lg" py="sm" style={rowBorder} wrap="wrap">
       <Box style={{ minWidth: 0, flex: 1 }}>
@@ -954,9 +972,26 @@ function RunRow({ run }: { run: Overview["recentRuns"][number] }) {
         <StatusBadge status={run.status} />
         <StatusBadge status={run.agentProvider} />
       </Group>
-      <Text size="sm" c="dimmed">
-        {run.approvalRequired ? "approval" : "queued"}
-      </Text>
+      {waiting ? (
+        <Group gap="xs">
+          <Button size="xs" color="teal" loading={approve.isPending} onClick={() => approve.mutate()}>
+            Approve
+          </Button>
+          <Button
+            size="xs"
+            variant="subtle"
+            color="gray"
+            loading={cancel.isPending}
+            onClick={() => cancel.mutate()}
+          >
+            Cancel
+          </Button>
+        </Group>
+      ) : (
+        <Text size="sm" c="dimmed">
+          {run.approvalRequired ? "approval" : "queued"}
+        </Text>
+      )}
     </Group>
   );
 }
