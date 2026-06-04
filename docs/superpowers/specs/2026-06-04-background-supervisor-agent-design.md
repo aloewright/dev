@@ -223,3 +223,88 @@ Answers are grounded in the agent's Session memory + live SQL.
    `dispatch_fix_run` + `trigger_deploy`, autonomy flag + caps, alerts.
 
 Each phase is independently shippable and testable.
+
+---
+
+## Refinements (2026-06-04)
+
+These four additions came out of the same brainstorming session and are folded into
+the phases above rather than added as new subsystems. They sharpen the dashboard,
+the agent's memory, and the runtime it operates in.
+
+### R1. Live Board + Data Board (real-time, WebSocket)
+
+The dashboard (Phase 4) gains two always-current panels. Both are driven by the
+**Agents SDK WebSocket channel**, not polling — the `SupervisorAgent` is already a
+Durable Object, so the React client connects with `useAgent` and receives
+`broadcast()` pushes. Polling (`react-query refetchInterval`) is the fallback only
+if a client cannot hold a socket.
+
+**Live Board** — one card per *running* run:
+- repo, objective, current stage (latest `run_event`), elapsed time, latest output
+  line, and an **Intervene** control (Cancel now via existing `cancelRun`; a later
+  "nudge the agent" affordance is out of scope for this pass).
+- Data flow: the container (`server.mjs`) already emits progress via `run_event`s.
+  We add a lightweight forward — each `recordRunEvent` for a running run pings the
+  `SupervisorAgent` (`onRunEvent`), which updates its in-memory live-set and calls
+  `broadcast({type:"live", runs:[...]})`. No new polling loop; the agent fans out
+  what it already receives on the worker→agent ping (Phase 2's run-completion ping
+  is widened to all lifecycle events for running runs).
+
+**Data Board** — live counters, same broadcast channel:
+- `queued` count, `running` count, **Linear issues open** (total across connected
+  projects), and **completed today / this week / this month / all-time** computed
+  by SQL time-buckets over merged tasks (`tasks` joined to runs, `merged_at`).
+- The counts are recomputed on each lifecycle ping (cheap aggregate queries) and
+  included in the same `broadcast`, so both boards update from one message.
+
+`GET /api/supervisor/board` returns the same shape for first paint / fallback.
+
+### R2. Auto-compaction (Agents SDK Session API, native)
+
+Both layers compact, and neither needs a new dependency:
+- **Supervisor** → the `SupervisorAgent` session uses the Agents SDK **Session API**
+  (`agents/experimental/memory`):
+  ```ts
+  const session = Session.create(this)
+    .withContext("memory", { maxTokens: 1500 })       // bounded learned-facts block
+    .onCompaction(createCompactFunction({ summarize })) // summarize old history
+    .compactAfter(50_000)                               // auto-compact past this token count
+    .withCachedPrompt();
+  ```
+  When history exceeds the threshold it auto-summarizes older messages with the LLM,
+  stores the overlay, and keeps the originals in SQLite (non-fatal on failure). The
+  `summarize` function routes through the Cloudflare AI Gateway per the house rule —
+  never a direct provider call.
+- **Coding agents** → `claude-code` already auto-compacts its own context window
+  during long `--print` sessions, natively. Nothing to add on the container side.
+
+This is wired into Phase 2 (the agent skeleton already creates the Session).
+
+### R3. Model assignment
+
+Locked from `docs/supervisor/MODELS.md`:
+- **Coding agents** (container `server.mjs`): `claude-sonnet-4-6`, medium effort,
+  `--max-turns 250`. Already deployed (container image carries these flags).
+- **Supervisor agent**: `claude-opus-4-8`, high reasoning ("ultracode"). The
+  `summarize` and any judgment calls in `watchTick`/scoring use this tier via the
+  gateway.
+
+### R4. Superpowers skills available to the supervisor
+
+The 14 local "superpowers" skills are uploaded to R2
+(`fly-dev-template-assets/skills/superpowers/<name>/SKILL.md`), manifested in
+`docs/supervisor/superpowers-skills.json`. The `SupervisorAgent` can read this
+manifest and pull a skill's text into context when a watch/intervene decision calls
+for a documented procedure (e.g. systematic-debugging when triaging a stuck run).
+This is a read-only capability — the agent surfaces guidance, it does not mutate the
+skill store.
+
+### Phase impact summary
+
+| Refinement | Folds into | New work |
+|---|---|---|
+| R1 Live/Data Board | Phase 4 (Dashboard) | widen run-event ping to all lifecycle events; `broadcast`; `/api/supervisor/board`; two React panels via `useAgent` |
+| R2 Auto-compaction | Phase 2 (Agent skeleton) | `Session` builder with `onCompaction`/`compactAfter` |
+| R3 Models | already shipped (container) + Phase 2 | supervisor uses opus-4.8 for its gateway calls |
+| R4 Superpowers skills | already shipped (R2 upload) + Phase 6 | agent reads manifest during watch/intervene |
