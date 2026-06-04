@@ -4,9 +4,9 @@
 
 **Goal:** Build a persistent per-user `SupervisorAgent` (Cloudflare Agents SDK Durable Object) that watches the autonomous run pipeline, scores effectiveness, sends daily/weekly/per-repo code reports by email, surfaces a real-time effectiveness dashboard (Live Board + Data Board over the Agents WebSocket channel), answers questions in a TanStack-AI chat panel, and intervenes (requeue, comment, pause, dispatch a fix run, trigger deploy, escalate) within hard safety bounds.
 
-**Architecture:** One `SupervisorAgent` per fly user, keyed canonically by the app **`user.id`** (`idFromName(user.id)`) on BOTH the server and the React client — this is the single most important invariant in the plan (global resolution G1). The server pings the agent and resolves every `/api/supervisor/*` route via `SUPERVISOR.idFromName(user.id)`; the React Live Board connects with `useAgent({ agent: 'supervisor', name: user.id })`. Because `this.name === user.id` inside the agent, all agent-side SQL filters on `WHERE user_id = this.name` correctly (`runs.user_id == app_users.id == user.id`). The DO is NOT keyed on `flyUserSlug` anywhere — `flyUserSlug` (e.g. `local-dev`) is a slugified value distinct from the `user_<uuid>` id, and keying on it would point the client socket at a different, empty DO instance than the one the worker scores into and broadcasts from. The worker pipeline pings the agent on every run lifecycle event; the agent scores tasks, maintains a bounded Session-API memory (auto-compacted via the native Agents SDK Session API), runs scheduled report/watch jobs, and `broadcast()`s live state to `useAgent`-connected React clients. A new D1 migration (`0005_supervisor.sql`) adds the 7-table effectiveness hierarchy. All scoring/report/judgment/chat LLM calls route through the Cloudflare AI Gateway via the sanctioned worker-side pattern `env.AI.run("@cf/openai/gpt-oss-120b", input, { gateway: { id } })` — dynamic routes and `fetch()` to the gateway do NOT resolve inside a Worker (see `~/.claude/CLAUDE.md`). NOTE (global resolution G3): Spec R3 / `docs/supervisor/MODELS.md` mandate `claude-opus-4-8` for the supervisor, but opus-4.8 is **not reachable from inside a Worker today** (no `@cf` Anthropic opus id exists; `dynamic/*` and gateway `fetch()` are both broken in-Worker). The in-Worker supervisor therefore runs on `@cf/openai/gpt-oss-120b` as a deliberate, load-bearing deviation that is surfaced to the user as an open decision in the Phase 6 / Notes section — NOT buried in a code comment.
+**Architecture:** One `SupervisorAgent` per fly user, keyed canonically by the app **`user.id`** (`idFromName(user.id)`) on BOTH the server and the React client — this is the single most important invariant in the plan (global resolution G1). The server pings the agent and resolves every `/api/supervisor/*` route via `SUPERVISOR.idFromName(user.id)`; the React Live Board connects with `useAgent({ agent: 'supervisor', name: user.id })`. Because `this.name === user.id` inside the agent, all agent-side SQL filters on `WHERE user_id = this.name` correctly (`runs.user_id == app_users.id == user.id`). The DO is NOT keyed on `flyUserSlug` anywhere — `flyUserSlug` (e.g. `local-dev`) is a slugified value distinct from the `user_<uuid>` id, and keying on it would point the client socket at a different, empty DO instance than the one the worker scores into and broadcasts from. The worker pipeline pings the agent on every run lifecycle event; the agent scores tasks, maintains a bounded Session-API memory (auto-compacted via the native Agents SDK Session API), runs scheduled report/watch jobs, and `broadcast()`s live state to `useAgent`-connected React clients. A new D1 migration (`0005_supervisor.sql`) adds the 7-table effectiveness hierarchy. All scoring/report/judgment/chat LLM calls route through the Cloudflare AI Gateway on **Gemini 3.1 Pro via Google Vertex AI** (global resolution G3). Vertex is a first-class gateway provider; with **BYOK** (the GCP service-account JSON stored in the gateway's Provider Keys + region) the binding supplies `cf-aig-authorization` and the gateway injects Google's credentials, so no provider key lives in app code — this honors the house rule (route through the gateway; never call providers directly). The in-Worker mechanism is the **Universal-endpoint binding form** `env.AI.gateway(id).run({ provider: "google-vertex-ai", endpoint: "v1/projects/{project}/locations/{region}/publishers/google/models/gemini-3.1-pro:generateContent", query: {...} })` against a **regional** endpoint (`us-central1`; `global` has limited model support). Because this is a DIRECT provider call (not a `dynamic/*` route), the "skips ahead in the fallback chain" quirk in `~/.claude/CLAUDE.md` does NOT apply. The Vertex `generateContent` response is parsed as `candidates[0].content.parts[].text`. See the Phase 6 / Notes "Supervisor model" entry for the BYOK prerequisite, the in-Worker verification step, and the honest REST-API fallback.
 
-**Tech Stack:** Cloudflare Workers + Hono (API), Durable Objects via `agents@0.13.2` (`Agent`, `routeAgentRequest`, `Session` from `agents/experimental/memory/session`, `createCompactFunction` from `agents/experimental/memory/utils`), D1 (SQLite), Cloudflare Email Workers (`cloudflare:email` + `mimetext`, **already a resolved dependency** — not re-installed), `@tanstack/ai` + `@tanstack/ai-react` (chat + tool-calling, the only two packages installed fresh), Mantine + TanStack React Router + React Query + `agents/react` `useAgent` (frontend), Vitest (tests). The supervisor LLM model in-Worker is `@cf/openai/gpt-oss-120b` via the AI Gateway (see Architecture note on the opus-4.8 tension, G3).
+**Tech Stack:** Cloudflare Workers + Hono (API), Durable Objects via `agents@0.13.2` (`Agent`, `routeAgentRequest`, `Session` from `agents/experimental/memory/session`, `createCompactFunction` from `agents/experimental/memory/utils`), D1 (SQLite), Cloudflare Email Workers (`cloudflare:email` + `mimetext`, **already a resolved dependency** — not re-installed), `@tanstack/ai` + `@tanstack/ai-react` (chat + tool-calling, the only two packages installed fresh), Mantine + TanStack React Router + React Query + `agents/react` `useAgent` (frontend), Vitest (tests). The supervisor LLM model in-Worker is **Gemini 3.1 Pro via Google Vertex AI, routed through the Cloudflare AI Gateway** (BYOK service-account JSON in the gateway's Provider Keys, regional endpoint `us-central1`, called via the Universal-endpoint binding form `env.AI.gateway(id).run({ provider: "google-vertex-ai", ... })`) — see the Architecture note and the Phase 6 / Notes "Supervisor model" entry (G3).
 
 ---
 
@@ -21,7 +21,7 @@
 | `worker/src/agents/supervisor.ts` | Create | `SupervisorAgent extends Agent<Env, SupervisorState>`: Session memory + auto-compaction, `onStart` schedules, `fetch()` router (`/ping`, `/chat`, `/report`, `/board`), `watchTick`, `dailyDigest`, `weeklyReport`, `broadcast` of live/data board, intervention tool set. All agent SQL filters on `WHERE user_id = this.name` where `this.name === user.id` (G1). |
 | `worker/src/agents/supervisor-prompts.ts` | Create | Pure prompt/markdown builders: `buildReportMarkdown`, `buildSummaryPrompt`, `buildWatchPrompt`, `parseWatchDecision`, `interventionAllowed` (cap logic). |
 | `tests/supervisor-prompts.test.ts` | Create | Unit tests for report markdown assembly, watch decision parsing, intervention cap logic. |
-| `worker/src/agents/supervisor-llm.ts` | Create | `supervisorSummarize(env, prompt)` and `supervisorChatStream(env, messages, tools)` — the gateway-bound `@cf/openai/gpt-oss-120b` callers used by the agent and chat (G3; carries the house-rule comment pointing at `~/.claude/CLAUDE.md` and the Notes deviation). |
+| `worker/src/agents/supervisor-llm.ts` | Create | `supervisorSummarize(env, prompt)` and `supervisorChatStream(env, messages, tools)` — the gateway-bound **Gemini 3.1 Pro via Google Vertex AI** callers used by the agent and chat (G3; Universal-endpoint binding form `env.AI.gateway(id).run({ provider: "google-vertex-ai", ... })`, BYOK, regional endpoint; carries the house-rule comment pointing at `~/.claude/CLAUDE.md` and the Notes "Supervisor model" entry). |
 | `worker/src/agents/supervisor-email.ts` | Create | `sendReportEmail(env, { subject, html, text })` over the `REPORT_EMAIL` binding (`cloudflare:email` + `mimetext`). |
 | `worker/src/agents/supervisor-tools.ts` | Create | Intervention tool implementations: `requeueRun`, `commentOnPr`, `pauseRepo`, `dispatchFixRun`, `triggerDeploy`, `escalate` (reuse existing `enqueueRun`, `mergeWhenGreen`, `createTaskRun`, GitHub helpers). Shared by `watchTick` AND the chat tool-dispatch layer, gated by `interventionAllowed`/`SUPERVISOR_AUTONOMY`. |
 | `worker/src/agents/supervisor-chat-tools.ts` | Create | Chat tool-dispatch layer (issue #5): the read-only query tools (effectiveness, why-did-X-fail, list PRs) plus the intervention tools from `supervisor-tools.ts`, exposed to the TanStack AI `chat({adapter, messages, tools})` loop (or the spec-allowed fallback that parses the model's tool intent and dispatches), gated by `interventionAllowed`/`SUPERVISOR_AUTONOMY`. |
@@ -428,7 +428,7 @@ export async function writeScores(
 
 > **G1 — SupervisorAgent DO identity = the app `user.id`, everywhere.** `pingSupervisor` resolves `SUPERVISOR.idFromName(owner.user_id)`. Inside the agent `this.name === user.id`, so all agent SQL `WHERE user_id = this.name` is correct — never key the agent's SQL on the slug. Step 9 adds a test asserting the value passed to `idFromName` equals the value used in the `user_id` WHERE clause.
 
-- [ ] **Step 1: Write the failing test for `scoreTask`.** Create `tests/score-task.test.ts` driving `scoreTask` against an in-memory fake `env.DB` capturing SQL, asserting it ensures a task spine and writes deterministic score rows (mocking `env.AI.run` so the quality call is exercised through the gateway pattern). Note the fake `runs` row mirrors the REAL schema: `pr_url`/`commit_sha`/`branch_name` are columns, while `merged`/`testsRun`/`testsPassed`/`summary` live **only** inside `metadata_json` (as the widened `markRunCompleted` of Step 5 persists them). There is **no `diff`**:
+- [ ] **Step 1: Write the failing test for `scoreTask`.** Create `tests/score-task.test.ts` driving `scoreTask` against an in-memory fake `env.DB` capturing SQL, asserting it ensures a task spine and writes deterministic score rows (mocking `env.AI.gateway(id).run` so the Gemini 3.1 Pro / Vertex quality call is exercised through the gateway's Universal-endpoint binding form). Note the fake `runs` row mirrors the REAL schema: `pr_url`/`commit_sha`/`branch_name` are columns, while `merged`/`testsRun`/`testsPassed`/`summary` live **only** inside `metadata_json` (as the widened `markRunCompleted` of Step 5 persists them). There is **no `diff`**:
 ```ts
 /* AGPL-3.0-or-later */
 import { describe, expect, it } from "vitest";
@@ -436,7 +436,7 @@ import { scoreTask } from "../worker/src/platform/effectiveness";
 
 function fakeEnv() {
   const rows: Record<string, unknown[]> = { tasks: [], scores: [], objectives: [], workflows: [] };
-  const seen: { ai?: { model: string; opts: unknown } } = {};
+  const seen: { ai?: { gatewayId: string; provider: string; endpoint: string; query: unknown } } = {};
   // Mirrors the real runs schema after markRunCompleted's persist:
   //   pr_url/commit_sha/branch_name are COLUMNS;
   //   merged/testsRun/testsPassed/summary live ONLY in metadata_json (no diff).
@@ -467,11 +467,16 @@ function fakeEnv() {
   };
   const env = {
     AI_GATEWAY_ID: "x",
+    VERTEX_PROJECT_ID: "proj_123",
+    // Universal-endpoint binding form: env.AI.gateway(id).run({ provider, endpoint, query }).
     AI: {
-      run: async (model: string, _i: unknown, opts: unknown) => {
-        seen.ai = { model, opts };
-        return { choices: [{ message: { content: "85" } }] };
-      },
+      gateway: (id: string) => ({
+        run: async (input: { provider: string; endpoint: string; query: unknown }) => {
+          seen.ai = { gatewayId: id, provider: input.provider, endpoint: input.endpoint, query: input.query };
+          // Vertex generateContent response shape:
+          return { candidates: [{ content: { parts: [{ text: "85" }] } }] };
+        },
+      }),
     },
     DB: {
       prepare(sql: string) {
@@ -510,15 +515,22 @@ describe("scoreTask", () => {
     expect(dims).toContain("tests_passed");
     expect(dims).toContain("time_to_merge_mins");
     expect(dims).toContain("quality");
-    expect(seen.ai?.model).toBe("@cf/openai/gpt-oss-120b");
-    expect(seen.ai?.opts).toEqual({ gateway: { id: "x" } });
+    // G3: the supervisor's quality score runs on Gemini 3.1 Pro via Google Vertex AI,
+    // routed through the AI Gateway via the Universal binding form (a DIRECT provider call).
+    expect(seen.ai?.gatewayId).toBe("x");
+    expect(seen.ai?.provider).toBe("google-vertex-ai");
+    expect(seen.ai?.endpoint).toContain("gemini-3.1-pro:generateContent");
+    expect(seen.ai?.endpoint).toContain("us-central1");
+    expect(seen.ai?.endpoint).toContain("proj_123");
   });
 
   it("still writes deterministic scores when the gateway throws (no quality row)", async () => {
     const { env, rows } = fakeEnv();
-    (env as any).AI.run = async () => {
-      throw new Error("gateway down");
-    };
+    (env as any).AI.gateway = () => ({
+      run: async () => {
+        throw new Error("gateway down");
+      },
+    });
     await scoreTask(env, "run_1");
     const dims = rows.scores.map((s: any) => s.v[3]);
     expect(dims).toContain("merged");
@@ -531,7 +543,8 @@ describe("scoreTask", () => {
     await scoreTask(env, "run_1");
     const dims = rows.scores.map((s: any) => s.v[3]);
     expect(dims).toContain("quality");
-    expect(seen.ai?.model).toBe("@cf/openai/gpt-oss-120b");
+    expect(seen.ai?.provider).toBe("google-vertex-ai");
+    expect(seen.ai?.endpoint).toContain("gemini-3.1-pro:generateContent");
   });
 });
 ```
@@ -541,7 +554,8 @@ describe("scoreTask", () => {
 
 - [ ] **Step 3: Implement `scoreTask`, `getSupervisorOverview`, `getBoardData`, and `backfillRunsToTasks` (minimal).** Append to `worker/src/platform/effectiveness.ts`. Note: `pr_url`/`commit_sha`/`branch_name` are read as real `runs` columns; `merged`/`tests_run`/`tests_passed`/`summary` are read via `json_extract` from the metadata persisted by `markRunCompleted` (Step 5); **there is no `diff`** anywhere — the quality call is fed `summary` only:
 ```ts
-const QUALITY_MODEL = "@cf/openai/gpt-oss-120b"; // gateway-routed; see ~/.claude/CLAUDE.md "Inside a Worker"
+const QUALITY_MODEL = "gemini-3.1-pro"; // Gemini 3.1 Pro via Google Vertex AI, routed through the AI Gateway (G3; see supervisor-llm.ts)
+const VERTEX_REGION = "us-central1"; // regional endpoint; `global` has limited model support
 
 // Score one run's task: deterministic rows always; quality (0-100) via the
 // AI Gateway when a summary exists. Never throws (caller is the pipeline).
@@ -641,20 +655,29 @@ async function llmQualityScore(
     `Objective: ${objective}\nAgent summary of the change: ${summary ?? "(none)"}\n\n` +
     "Based on the objective and the summary of what the agent changed, rate the code " +
     "change quality from 0 to 100. Respond with ONLY the integer.";
-  // House-rule: inside a Worker only @cf/<model> ids resolve through the AI binding;
-  // dynamic/* routes and fetch() to the gateway are broken in-Worker. See
-  // ~/.claude/CLAUDE.md "Inside a Worker". Route through the gateway for caching/obs.
+  // House-rule / G3: the supervisor's quality score runs on Gemini 3.1 Pro via Google
+  // Vertex AI, ROUTED THROUGH the AI Gateway (BYOK; the gateway injects Google's creds).
+  // In-Worker mechanism is the Universal-endpoint binding form — a DIRECT provider call,
+  // not a dynamic route. See ~/.claude/CLAUDE.md and supervisor-llm.ts.
+  const endpoint =
+    `v1/projects/${env.VERTEX_PROJECT_ID}/locations/${VERTEX_REGION}/publishers/google/models/${QUALITY_MODEL}:generateContent`;
   const raw = await (
     env.AI as unknown as {
-      run: (m: string, i: unknown, o: { gateway: { id: string } }) => Promise<unknown>;
+      gateway: (id: string) => {
+        run: (input: { provider: string; endpoint: string; query: unknown }) => Promise<unknown>;
+      };
     }
-  ).run(
-    QUALITY_MODEL,
-    { messages: [{ role: "user", content: prompt }], max_tokens: 8 },
-    { gateway: { id: gatewayId } },
-  );
-  const text = (raw as { choices?: Array<{ message?: { content?: string } }> })?.choices?.[0]?.message
-    ?.content;
+  ).gateway(gatewayId).run({
+    provider: "google-vertex-ai",
+    endpoint,
+    query: {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 8, temperature: 0.2 },
+    },
+  });
+  // Vertex generateContent response shape: candidates[0].content.parts[].text.
+  const text = (raw as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> })
+    ?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("");
   const n = Number.parseInt((text ?? "").match(/\d+/)?.[0] ?? "", 10);
   return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
 }
@@ -1134,7 +1157,10 @@ and in the vars block (after `CONTINUE_EXECUTE_CAP?`):
   SUPERVISOR_AUTONOMY?: string;        // "auto" | "propose" | "off"
   REPORT_FROM_ADDRESS?: string;        // verified Email Routing sender
   REPORT_TO_ADDRESS?: string;          // verified destination
+  VERTEX_PROJECT_ID?: string;          // GCP project id for the supervisor's Vertex AI (Gemini 3.1 Pro) calls
 ```
+
+> **Vertex AI BYOK prerequisite (one-time, dashboard).** The supervisor reasons on **Gemini 3.1 Pro via Google Vertex AI, routed through the AI Gateway** (G3 — see Architecture + Phase 6 Notes). Before the supervisor's LLM calls can resolve in-Worker, configure Vertex BYOK in the AI Gateway dashboard: **Provider Keys → Google Vertex AI → paste the GCP service-account JSON, select the region (`us-central1`)**. With BYOK stored there, the gateway injects Google's credentials and the in-Worker call needs only the gateway auth the `env.AI` binding already supplies — no provider key in app code (house-rule compliant). The `VERTEX_PROJECT_ID` var added above is the GCP project id that `supervisor-llm.ts` interpolates into the Vertex endpoint path.
 
 - [ ] **Step 4: Update `wrangler.jsonc`.** In `durable_objects.bindings` append:
 ```jsonc
@@ -1159,11 +1185,12 @@ Add a top-level `send_email` binding block (after `r2_buckets`):
     }
   ],
 ```
-In `vars` add:
+In `vars` add (`VERTEX_PROJECT_ID` is the GCP project id whose Vertex AI serves the supervisor's Gemini 3.1 Pro calls; set it to your project id):
 ```jsonc
     "SUPERVISOR_AUTONOMY": "auto",
     "REPORT_FROM_ADDRESS": "reports@fly.pm",
-    "REPORT_TO_ADDRESS": "pleasewritemealetter@gmail.com"
+    "REPORT_TO_ADDRESS": "pleasewritemealetter@gmail.com",
+    "VERTEX_PROJECT_ID": "<your-gcp-project-id>"
 ```
 
 - [ ] **Step 5: Add deps.** `@tanstack/ai` and `@tanstack/ai-react` are absent from `node_modules` and must be installed. `mimetext` is ALREADY a resolved dependency (`node_modules/mimetext` present with the exact API later phases use: `createMimeMessage`, `setSender`, `setRecipient`, `setSubject`, `addMessage`, `asRaw`) — do NOT reinstall it. Run:
@@ -1192,7 +1219,7 @@ node -e "console.log(require('./package.json').dependencies.mimetext ? 'mimetext
 - Test path: `tests/supervisor-summarize.test.ts`
 - Test path: `tests/supervisor-do-identity.test.ts`
 
-> **DO identity invariant (G1).** The SupervisorAgent Durable Object is keyed on the app `user.id` everywhere — the server resolves `SUPERVISOR.idFromName(user.id)` on every route and ping, so inside the agent `this.name === user.id`. Because `runs.user_id === app_users.id === user.id`, every agent-side query that filters `WHERE user_id = this.name` is correct against the real schema. NEVER key the agent (or its SQL) on `flyUserSlug` — `flyUserSlug` (e.g. `local-dev`, from `auth-session.ts` slugify) is a distinct field from `user.id` (`user_<uuid>`), and keying on it would point the WebSocket client at an empty DO instance while the worker scores/broadcasts into a different one. The HTTP control route param below is named `flyUserId` for parity with the existing `/agents/orchestrator/:flyUserId` route, but the value passed to it by every `/api/supervisor/*` caller and by `pingSupervisor` is `user.id`, not the slug. The model used by every in-Worker supervisor LLM call is `@cf/openai/gpt-oss-120b` per G3 (see the model-tension note below and `supervisor-llm.ts`).
+> **DO identity invariant (G1).** The SupervisorAgent Durable Object is keyed on the app `user.id` everywhere — the server resolves `SUPERVISOR.idFromName(user.id)` on every route and ping, so inside the agent `this.name === user.id`. Because `runs.user_id === app_users.id === user.id`, every agent-side query that filters `WHERE user_id = this.name` is correct against the real schema. NEVER key the agent (or its SQL) on `flyUserSlug` — `flyUserSlug` (e.g. `local-dev`, from `auth-session.ts` slugify) is a distinct field from `user.id` (`user_<uuid>`), and keying on it would point the WebSocket client at an empty DO instance while the worker scores/broadcasts into a different one. The HTTP control route param below is named `flyUserId` for parity with the existing `/agents/orchestrator/:flyUserId` route, but the value passed to it by every `/api/supervisor/*` caller and by `pingSupervisor` is `user.id`, not the slug. The model used by every in-Worker supervisor LLM call is **Gemini 3.1 Pro via Google Vertex AI, routed through the AI Gateway** (BYOK, regional endpoint, Universal binding form) per G3 (see the "Supervisor model" note below and `supervisor-llm.ts`).
 
 - [ ] **Step 1: Write the failing test.** Create `tests/supervisor-summarize.test.ts` for the gateway-bound summarize helper used by `createCompactFunction` and reports:
 ```ts
@@ -1201,30 +1228,44 @@ import { describe, expect, it } from "vitest";
 import { supervisorSummarize } from "../worker/src/agents/supervisor-llm";
 
 describe("supervisorSummarize", () => {
-  it("routes through the AI Gateway with the @cf model and returns text", async () => {
-    const seen: { model?: string; opts?: unknown } = {};
+  it("routes through the AI Gateway on Gemini 3.1 Pro (Vertex AI) and returns text", async () => {
+    const seen: { gatewayId?: string; provider?: string; endpoint?: string; query?: unknown } = {};
     const env = {
       AI_GATEWAY_ID: "x",
+      VERTEX_PROJECT_ID: "proj_123",
+      // Universal-endpoint binding form: env.AI.gateway(id).run({ provider, endpoint, query }).
       AI: {
-        run: async (model: string, _i: unknown, opts: unknown) => {
-          seen.model = model;
-          seen.opts = opts;
-          return { choices: [{ message: { content: "compact summary" } }] };
+        gateway: (id: string) => {
+          seen.gatewayId = id;
+          return {
+            run: async (input: { provider: string; endpoint: string; query: unknown }) => {
+              seen.provider = input.provider;
+              seen.endpoint = input.endpoint;
+              seen.query = input.query;
+              // Vertex generateContent response shape:
+              return { candidates: [{ content: { parts: [{ text: "compact summary" }] } }] };
+            },
+          };
         },
       },
     } as never;
     const out = await supervisorSummarize(env, "summarize this long history");
     expect(out).toBe("compact summary");
-    // G3: in-Worker supervisor LLM calls run on @cf/openai/gpt-oss-120b (only
-    // gateway-resolvable Worker model id today; opus-4.8 is not reachable here).
-    expect(seen.model).toBe("@cf/openai/gpt-oss-120b");
-    expect(seen.opts).toEqual({ gateway: { id: "x" } });
+    // G3: in-Worker supervisor LLM calls run on Gemini 3.1 Pro via Google Vertex AI,
+    // ROUTED THROUGH the AI Gateway (BYOK, regional endpoint). This is a DIRECT
+    // provider call via the Universal binding form — not a dynamic route.
+    expect(seen.gatewayId).toBe("x");
+    expect(seen.provider).toBe("google-vertex-ai");
+    expect(seen.endpoint).toContain("gemini-3.1-pro:generateContent");
+    expect(seen.endpoint).toContain("us-central1");
+    expect(seen.endpoint).toContain("proj_123");
   });
 
   it("returns an empty string when the gateway throws (non-fatal compaction)", async () => {
     const env = {
       AI_GATEWAY_ID: "x",
-      AI: { run: async () => { throw new Error("down"); } },
+      VERTEX_PROJECT_ID: "proj_123",
+      AI: { gateway: () => ({ run: async () => { throw new Error("down"); } }) },
     } as never;
     expect(await supervisorSummarize(env, "x")).toBe("");
   });
@@ -1239,66 +1280,75 @@ describe("supervisorSummarize", () => {
 /* AGPL-3.0-or-later */
 import type { Env } from "../env";
 
-// Supervisor LLM tier. HOUSE RULE / G3: route through the Cloudflare AI Gateway.
-// Inside a Worker/DO the ONLY working pattern is
-//   env.AI.run("@cf/<model>", input, { gateway: { id } })
-// dynamic/* routes and fetch() to the gateway do NOT resolve in a Worker
-// (see ~/.claude/CLAUDE.md "Inside a Worker"). Spec R3 / docs/supervisor/MODELS.md
-// want the supervisor on claude-opus-4-8, but there is no @cf Anthropic opus model
-// and opus-4.8 is unreachable from a Worker today. So this is a deliberate,
-// documented deviation: the supervisor reasons on @cf/openai/gpt-oss-120b in-Worker.
-// See the "House-rule tension: supervisor model" note in Phase 6 / Notes — this is
-// an OPEN DECISION surfaced to the user, with a future option to escalate specific
-// high-stakes judgments to a Node/HTTPS dynamic/research_gen path. Swap the model id
-// below back to a dynamic route once Worker-side dynamic routing is fixed upstream.
-const SUPERVISOR_MODEL = "@cf/openai/gpt-oss-120b";
+// supervisor-llm.ts — the supervisor reasons on Gemini 3.1 Pro via Google Vertex AI,
+// ROUTED THROUGH the Cloudflare AI Gateway (house rule: never call providers directly).
+// Vertex is a first-class gateway provider; with BYOK (service-account JSON stored in the
+// gateway's Provider Keys + region) the binding supplies cf-aig-authorization and the
+// gateway injects Google's credentials — no provider key in app code. In-Worker mechanism
+// is the Universal-endpoint binding form (a DIRECT provider call, not a dynamic route, so
+// the fallback-skip quirk in ~/.claude/CLAUDE.md does not apply). See the "Supervisor
+// model" note in Phase 6 / Notes for the verification + REST-API fallback.
+const SUPERVISOR_MODEL = "gemini-3.1-pro";
+const VERTEX_REGION = "us-central1"; // regional endpoint; `global` has limited model support
 
-type AiRunner = {
-  run: (m: string, i: unknown, o: { gateway: { id: string } }) => Promise<unknown>;
+type GatewayBinding = {
+  gateway: (id: string) => {
+    run: (input: { provider: string; endpoint: string; query: unknown; headers?: Record<string, string> }) => Promise<unknown>;
+  };
 };
 
+function vertexEndpoint(env: Env, model: string): string {
+  return `v1/projects/${env.VERTEX_PROJECT_ID}/locations/${VERTEX_REGION}/publishers/google/models/${model}:generateContent`;
+}
+
+// Parse the Vertex generateContent response: candidates[0].content.parts[].text.
 function readContent(raw: unknown): string {
-  const r = raw as { choices?: Array<{ message?: { content?: string | null } }> };
-  return r?.choices?.[0]?.message?.content ?? "";
+  const r = raw as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  return (r?.candidates?.[0]?.content?.parts ?? []).map((p) => p.text ?? "").join("");
+}
+
+async function vertexGenerate(
+  env: Env,
+  contents: Array<{ role: string; parts: Array<{ text: string }> }>,
+  maxOutputTokens: number,
+): Promise<string> {
+  const gatewayId = env.AI_GATEWAY_ID || "x";
+  const raw = await (env.AI as unknown as GatewayBinding).gateway(gatewayId).run({
+    provider: "google-vertex-ai",
+    endpoint: vertexEndpoint(env, SUPERVISOR_MODEL),
+    query: {
+      contents,
+      generationConfig: { maxOutputTokens, temperature: 0.2 },
+    },
+  });
+  return readContent(raw);
 }
 
 // Used by createCompactFunction({ summarize }) and by report generation.
 // Non-fatal: returns "" on gateway error so compaction degrades gracefully.
 export async function supervisorSummarize(env: Env, prompt: string): Promise<string> {
-  const gatewayId = env.AI_GATEWAY_ID || "x";
   try {
-    const raw = await (env.AI as unknown as AiRunner).run(
-      SUPERVISOR_MODEL,
-      { messages: [{ role: "user", content: prompt }], max_tokens: 1024 },
-      { gateway: { id: gatewayId } },
-    );
-    return readContent(raw);
+    return await vertexGenerate(env, [{ role: "user", parts: [{ text: prompt }] }], 1024);
   } catch {
-    return "";
+    return ""; // non-fatal: Session compaction tolerates a failed summarize
   }
 }
 
 // One-shot completion with a system + user prompt (reports, watch decisions).
+// Vertex generateContent has no dedicated "system" role; fold the system text into
+// the first user turn so the prompt still carries it.
 export async function supervisorComplete(
   env: Env,
   system: string,
   user: string,
   maxTokens = 1500,
 ): Promise<string> {
-  const gatewayId = env.AI_GATEWAY_ID || "x";
   try {
-    const raw = await (env.AI as unknown as AiRunner).run(
-      SUPERVISOR_MODEL,
-      {
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        max_tokens: maxTokens,
-      },
-      { gateway: { id: gatewayId } },
+    return await vertexGenerate(
+      env,
+      [{ role: "user", parts: [{ text: `${system}\n\n${user}` }] }],
+      maxTokens,
     );
-    return readContent(raw);
   } catch {
     return "";
   }
@@ -1340,8 +1390,8 @@ export class SupervisorAgent extends Agent<Env, SupervisorState> {
   private getSession(): Session {
     if (this.session) return this.session;
     // Session.create(this) auto-wires AgentSessionProvider over this.sql.
-    // summarize routes through the Cloudflare AI Gateway on @cf/openai/gpt-oss-120b
-    // (house rule / G3 — see supervisor-llm.ts).
+    // summarize routes through the Cloudflare AI Gateway on Gemini 3.1 Pro via
+    // Google Vertex AI (house rule / G3 — see supervisor-llm.ts).
     this.session = Session.create(this)
       .withContext("memory", { maxTokens: 1500 })
       .onCompaction(createCompactFunction({ summarize: (prompt) => supervisorSummarize(this.env, prompt) }))
@@ -1530,6 +1580,9 @@ describe("SupervisorAgent DO identity (G1)", () => {
 
 - [ ] **Step 9: Typecheck + dry-run.** `npm run typecheck && npm run cf:dry-run`
   Expected: typecheck clean; `cf:dry-run` succeeds and lists the `SupervisorAgent` DO + `REPORT_EMAIL` binding (validates the wrangler wiring + that `Session.create(this)` typechecks against the installed agents SDK).
+
+- [ ] **Step 9b: Verify the Vertex supervisor call resolves in `wrangler dev` (BYOK precondition).** Before relying on the Universal-endpoint binding form, confirm it actually reaches Gemini 3.1 Pro through the gateway against this account. Prereqs: Vertex BYOK is configured in the AI Gateway dashboard (Provider Keys → Google Vertex AI → service-account JSON + region `us-central1`) and `VERTEX_PROJECT_ID` is set (Task 4). Run `npm run dev` (or `npx wrangler dev`) and exercise a path that calls `supervisorSummarize`/`supervisorComplete` (e.g. trigger a `watchTick` or a report), and confirm the gateway returns a non-empty `candidates[0].content.parts[].text` (check the AI Gateway logs for a `google-vertex-ai` request, not a fallback).
+  Expected: a real Gemini 3.1 Pro completion via the gateway. **If the Universal binding form misbehaves in-Worker against this account**, fall back to the new AI REST API: `POST https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/chat/completions` with `model: "google-vertex-ai/gemini-3.1-pro"` plus the `cf-aig-gateway-id` header (from the agent or the cron path), and re-verify the same way before trusting it. See the Phase 6 / Notes "Supervisor model" entry.
 
 - [ ] **Step 10: Commit.** `git add worker/src/agents/supervisor.ts worker/src/agents/supervisor-llm.ts worker/src/index.ts tests/supervisor-summarize.test.ts tests/supervisor-do-identity.test.ts && git commit -m "feat(supervisor): SupervisorAgent skeleton + Session memory auto-compaction + schedules (DO keyed on user.id)"`
 
@@ -1776,7 +1829,14 @@ import { assembleReportData } from "../worker/src/agents/supervisor-report";
 function fakeEnv() {
   return {
     AI_GATEWAY_ID: "x",
-    AI: { run: async () => ({ choices: [{ message: { content: "narrative." } }] }) },
+    VERTEX_PROJECT_ID: "proj_123",
+    // supervisorComplete -> Gemini 3.1 Pro via Vertex AI through the gateway
+    // (Universal binding form; Vertex generateContent response shape).
+    AI: {
+      gateway: () => ({
+        run: async () => ({ candidates: [{ content: { parts: [{ text: "narrative." }] } }] }),
+      }),
+    },
     DB: {
       prepare(sql: string) {
         return {
@@ -3157,38 +3217,47 @@ export function encodeChatSse(deltas: AsyncIterable<string>): Response {
 // SupervisorAgent grounds these messages in Session memory + live SQL before
 // calling.
 //
-// HOUSE-RULE MODEL NOTE (see ~/.claude/CLAUDE.md "Inside a Worker" + Phase 6 Notes
-// "House-rule tension: supervisor model"): in-Worker LLM calls can ONLY resolve a
-// concrete `@cf/<model>` id through the AI binding; `dynamic/*` routes and
-// `fetch()` to the gateway are both broken in-Worker today. So SUPERVISOR_MODEL is
-// "@cf/openai/gpt-oss-120b" (defined in supervisor-llm.ts) and we still route
-// through the gateway via the { gateway: { id } } option for caching/observability.
-// Spec R3 wants claude-opus-4-8; that is not reachable from a Worker — tracked as
-// an open decision in the Phase 6 Notes. Do NOT swap in `dynamic/research_gen` or a
-// raw fetch() here; both fail in-Worker.
+// SUPERVISOR MODEL: Gemini 3.1 Pro via Google Vertex AI, ROUTED THROUGH the AI
+// Gateway (house rule: never call providers directly). Streaming uses the Vertex
+// `:streamGenerateContent?alt=sse` endpoint via the same Universal-endpoint binding
+// form (a DIRECT provider call, not a dynamic route — the fallback-skip quirk in
+// ~/.claude/CLAUDE.md does not apply). With BYOK the gateway injects Google's creds;
+// no provider key in app code. SSE frames carry the generateContent shape, so each
+// `data:` chunk is parsed as candidates[0].content.parts[].text. See the Phase 6
+// Notes "Supervisor model" entry for the in-Worker verification + REST-API fallback.
 export async function* supervisorChatStream(
   env: Env,
   messages: Array<{ role: string; content: string }>,
 ): AsyncGenerator<string> {
   const gatewayId = env.AI_GATEWAY_ID || "x";
+  // Map chat turns into Vertex `contents` (model expects "user"/"model" roles;
+  // fold any "system" turn into the user text).
+  const contents = messages.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
   let result: unknown;
   try {
-    result = await (env.AI as unknown as AiRunner).run(
-      SUPERVISOR_MODEL, // "@cf/openai/gpt-oss-120b" — see HOUSE-RULE MODEL NOTE above
-      { messages, max_tokens: 1500, stream: true },
-      { gateway: { id: gatewayId } },
-    );
+    result = await (env.AI as unknown as GatewayBinding).gateway(gatewayId).run({
+      provider: "google-vertex-ai",
+      // Streaming variant of the generateContent endpoint, SSE framing.
+      endpoint:
+        `v1/projects/${env.VERTEX_PROJECT_ID}/locations/${VERTEX_REGION}/publishers/google/models/${SUPERVISOR_MODEL}:streamGenerateContent?alt=sse`,
+      query: {
+        contents,
+        generationConfig: { maxOutputTokens: 1500, temperature: 0.2 },
+      },
+    });
   } catch (err) {
     yield `\n[error: ${err instanceof Error ? err.message : String(err)}]`;
     return;
   }
-  // env.AI.run(stream:true) returns a ReadableStream of SSE bytes. Parse OpenAI-
-  // compat `data:` frames into text deltas.
+  // streamGenerateContent?alt=sse returns a ReadableStream of SSE bytes; each
+  // `data:` frame is a partial generateContent chunk (candidates[].content.parts[].text).
   const stream = result as ReadableStream<Uint8Array>;
   if (!stream || typeof (stream as ReadableStream).getReader !== "function") {
-    // Non-streaming fallback: surface whatever content came back as one delta.
-    const text =
-      (result as { choices?: Array<{ message?: { content?: string } }> })?.choices?.[0]?.message?.content ?? "";
+    // Non-streaming fallback: surface whatever generateContent came back as one delta.
+    const text = readContent(result);
     if (text) yield text;
     return;
   }
@@ -3207,8 +3276,8 @@ export async function* supervisorChatStream(
       const payload = trimmed.slice(5).trim();
       if (payload === "[DONE]") return;
       try {
-        const json = JSON.parse(payload) as { response?: string; choices?: Array<{ delta?: { content?: string } }> };
-        const delta = json.response ?? json.choices?.[0]?.delta?.content ?? "";
+        // Each SSE frame is a partial generateContent response.
+        const delta = readContent(JSON.parse(payload));
         if (delta) yield delta;
       } catch {
         // ignore keep-alive / partial frames
@@ -4606,11 +4675,11 @@ Expected: `manifest OK: <N> skills` (N ≥ 1, exit 0).
 
 ## Notes on house rules honored throughout
 
-- **AI Gateway only:** every LLM touchpoint — `scoreTask` quality (`worker/src/platform/effectiveness.ts`), `supervisorSummarize`/`supervisorComplete`/`supervisorChatStream` (`worker/src/agents/supervisor-llm.ts`), and the Session `onCompaction` summarize callback — uses `env.AI.run("@cf/openai/gpt-oss-120b", input, { gateway: { id: env.AI_GATEWAY_ID || "x" } })`. No `dynamic/*` routes inside the Worker, no `fetch()` to the gateway, no provider keys. Comments at each call site point at `~/.claude/CLAUDE.md` "Inside a Worker".
+- **AI Gateway only:** every LLM touchpoint — `scoreTask` quality (`worker/src/platform/effectiveness.ts`), `supervisorSummarize`/`supervisorComplete`/`supervisorChatStream` (`worker/src/agents/supervisor-llm.ts`), and the Session `onCompaction` summarize callback — routes through the Cloudflare AI Gateway on **Gemini 3.1 Pro via Google Vertex AI** using the Universal-endpoint binding form `env.AI.gateway(env.AI_GATEWAY_ID || "x").run({ provider: "google-vertex-ai", endpoint: ".../gemini-3.1-pro:generateContent", query })`. With Vertex BYOK (service-account JSON in the gateway's Provider Keys + region) the gateway injects Google's credentials, so no provider key lives in app code. No raw `fetch()` to the gateway, no provider SDKs. Comments at each call site point at `~/.claude/CLAUDE.md` and the "Supervisor model" note below.
 - **R2 auto-compaction:** Session built with `Session.create(this).withContext("memory", { maxTokens: 1500 }).onCompaction(createCompactFunction({ summarize })).compactAfter(50_000).withCachedPrompt()` — native Agents SDK, no new dependency, summarize routed through the gateway.
 - **R1 live board:** driven by `broadcast()` from the DO + `useAgent` on the client (no `refetchInterval` while the socket is live); `/api/supervisor/board` is the first-paint/fallback only. **G1 — single DO identity:** the SupervisorAgent DO is addressed by the app `user.id` on **every** path — `pingSupervisor` (`SUPERVISOR.idFromName(owner.user_id)`), every `/api/supervisor/*` route (`SUPERVISOR.idFromName(user.id)`), and the client `useAgent({ agent: 'supervisor', name: user.id })`. Inside the agent `this.name === user.id`, and `runs.user_id == app_users.id == user.id`, so all `WHERE user_id = this.name` SQL is correct. The frontend obtains `user.id` from the app overview query (`Overview.user.id`, added to `getOverview` in `worker/src/platform/data.ts` and the `Overview` type in `src/App.tsx`) — never `flyUserSlug`. A test asserts the value passed to `idFromName` equals the value used in the `user_id` WHERE clause.
 
-- **House-rule tension — supervisor model (OPEN DECISION, surface to the user):** Spec R3 and `docs/supervisor/MODELS.md` mandate the supervisor on `claude-opus-4-8` (high effort) for judgment/summarize/watch/scoring. That model is **not reachable from inside a Worker today**: per `~/.claude/CLAUDE.md`, inside a Worker only `@cf/<model>` ids resolve through the `AI` binding; `dynamic/*` routes and `fetch()` to the gateway are both broken in-Worker; and there is no `@cf` Anthropic opus model. Therefore **every in-Worker supervisor LLM call runs on `@cf/openai/gpt-oss-120b`** (Session `summarize`/compaction, `watchTick` decisions, the effectiveness quality score) via `env.AI.run("@cf/openai/gpt-oss-120b", input, { gateway: { id: env.AI_GATEWAY_ID || "x" } })` — the only working in-Worker pattern, with a code comment at each call site pointing at the house rule. This is a real model substitution (correctness-critical supervisor reasoning runs on a weaker model than the spec mandates), and it is called out here rather than buried in a comment. **Future option / TODO:** escalate specific high-stakes judgments (watch decisions, effectiveness scoring) to a Node/cron HTTPS path where the gateway's `dynamic/research_gen` route DOES work (the fetch path works from outside a Worker), so opus-grade reasoning is available where correctness demands it; and swap the in-Worker calls back to a `dynamic/*` route once Worker-side dynamic routing is fixed upstream. **Flag to the user:** whether to accept gpt-oss-120b in-Worker as the supervisor model, or to move the supervisor's judgment calls to a Node/cron path now, is an open decision the user should make before any autonomous run.
-- **R3 models:** coding agents in the container remain `claude-sonnet-4-6` (unchanged — no `server.mjs` edits); these are unaffected by the in-Worker model tension above. The supervisor's own in-Worker judgment/report/summarize calls run on `@cf/openai/gpt-oss-120b` per the house-rule tension note above (NOT opus-4.8 — see that note).
+- **Supervisor model — Gemini 3.1 Pro via Vertex AI (through the AI Gateway, BYOK):** the supervisor reasons on **`gemini-3.1-pro` served by Google Vertex AI, ROUTED THROUGH the Cloudflare AI Gateway** for every in-Worker LLM call (Session `summarize`/compaction, `watchTick` decisions, report narratives, chat, and the effectiveness quality score). This is house-rule compliant: Vertex is a first-class gateway provider, and with **BYOK** the GCP service-account JSON is stored in the gateway's Provider Keys (+ region) so the gateway injects Google's credentials — the app only sends the gateway auth the `env.AI` binding already supplies, never a provider key. **Prerequisite (one-time, Task 4):** configure Vertex BYOK in the AI Gateway dashboard (Provider Keys → Google Vertex AI → paste the service-account JSON, select region `us-central1`) and set the `VERTEX_PROJECT_ID` wrangler var. **In-Worker mechanism:** the Universal-endpoint binding form `env.AI.gateway(id).run({ provider: "google-vertex-ai", endpoint: "v1/projects/{project}/locations/us-central1/publishers/google/models/gemini-3.1-pro:generateContent", query })` (streaming uses `:streamGenerateContent?alt=sse`). This is a DIRECT provider call, not a `dynamic/*` route, so the "skips ahead in the fallback chain" quirk in `~/.claude/CLAUDE.md` does not apply. Use a **regional** endpoint (`us-central1`); `global` has limited model support. Responses are parsed as `candidates[0].content.parts[].text`. **Verification + honest fallback (also a Task 5 verification step):** the implementer MUST confirm the Universal binding call resolves in `wrangler dev` before relying on it. If the binding form misbehaves in-Worker against this account, fall back to the new AI REST API — `POST https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/chat/completions` with `model: "google-vertex-ai/gemini-3.1-pro"` and the `cf-aig-gateway-id` header — from the agent or the cron path, verified the same way before it is trusted.
+- **R3 models:** coding agents in the container remain `claude-sonnet-4-6` (unchanged — no `server.mjs` edits); these are unaffected by the supervisor-model choice above. The supervisor's own in-Worker judgment/report/summarize calls run on **Gemini 3.1 Pro via Google Vertex AI, routed through the AI Gateway** per the "Supervisor model" note above.
 - **R4 superpowers:** read-only manifest fetch from R2; the agent surfaces guidance and never mutates the skill store. The manifest is uploaded once (Task 16 Step 5) from `docs/supervisor/superpowers-skills.json` to `TEMPLATE_ASSETS` at `skills/superpowers/manifest.json` (the exact key `loadSkillManifest` reads), `SkillManifestEntry` mirrors the real `{name, r2_bucket, r2_key, description}` shape, and a smoke check asserts the loaded manifest is non-empty so R4 fails loudly rather than silently degrading.
 - **Safety bounds:** `interventionAllowed` enforces per-repo/hour caps + never-re-act, `SUPERVISOR_AUTONOMY` downgrades to propose-only or off without a code change, and `dispatch_fix_run`/`trigger_deploy` inherit the existing land-loop merge-only-when-green gate. The `createTaskRun` pause gate blocks ALL autonomous run sources (`supervisor`, `linear-webhook`, `github-webhook`, `github-pr-comment`, `continue`) for a paused repo — including the supervisor's own `dispatch_fix_run` (a paused repo is paused for everyone; unpause via `POST /api/supervisor/pause {paused:false}` to let fixes run); manual user runs (`dev.fly.pm`) are never blocked. `trigger_deploy` is honest: it never returns `ok:true` for a no-op — it records an alert and returns `ok:false` (`note:"delegated-to-ci"` when no CF token, `note:"not-implemented"` + escalation when a CF token is present but no concrete deploy endpoint is wired). fly-dev's own container-image rebuild is surfaced as an escalation, not attempted from the Worker.

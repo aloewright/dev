@@ -9,14 +9,13 @@ Used in `container/server.mjs` `agentCommand()` for every sandbox coding run. So
 
 ## Supervisor agent (not yet built)
 
-**Model:** `claude-opus-4-8`
-**Intended flags:** `--model claude-opus-4-8 --effort high` (ultracode / high reasoning)
+**Supervisor:** gemini-3.1-pro via Google Vertex AI, routed through the Cloudflare AI Gateway (BYOK, regional endpoint us-central1).
 
-Recorded here for when `SupervisorAgent` is implemented. The supervisor orchestrates coding agents, evaluates their output, decides whether a PR is mergeable, and handles escalation — tasks that require deep reasoning and judgment rather than throughput. Opus 4.8 with high effort is the right trade-off: it runs infrequently (once per run, not per agent turn), so the higher cost is acceptable, and the quality uplift directly affects correctness of the overall pipeline.
+The supervisor's in-Worker LLM calls run on **Gemini 3.1 Pro served by Google Vertex AI, ROUTED THROUGH the Cloudflare AI Gateway** — honoring the house rule (route through the gateway; never call providers directly). Vertex is a first-class gateway provider; with **BYOK** the GCP service-account JSON is stored in the gateway's Provider Keys (+ region), so the gateway injects Google's credentials and app code only sends the gateway auth — no provider key. In-Worker mechanism is the Universal-endpoint binding form `env.AI.gateway(id).run({ provider: "google-vertex-ai", endpoint: ".../gemini-3.1-pro:generateContent", query })` against the **regional** endpoint `us-central1` (`global` has limited model support); responses are parsed as `candidates[0].content.parts[].text`. The supervisor orchestrates coding agents, evaluates their output, decides whether a PR is mergeable, and handles escalation — tasks that require deep reasoning and judgment rather than throughput — and it runs infrequently (once per run, not per agent turn).
 
 ## Summary table
 
-| Role | Model | Effort | Why |
+| Role | Model | Routing | Why |
 |---|---|---|---|
-| Coding agent (sandbox) | `claude-sonnet-4-6` | `medium` | High volume, cost/latency sensitive |
-| Supervisor (planned) | `claude-opus-4-8` | `high` | Low volume, correctness critical |
+| Coding agent (sandbox) | `claude-sonnet-4-6` | `--effort medium` | High volume, cost/latency sensitive |
+| Supervisor (planned) | `gemini-3.1-pro` (Google Vertex AI) | via Cloudflare AI Gateway (BYOK, regional `us-central1`) | Low volume, correctness critical |
