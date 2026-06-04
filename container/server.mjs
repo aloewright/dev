@@ -205,11 +205,13 @@ function testStatusLine(gate) {
     : `❌ Tests failed (${gate.projectType}, exit ${gate.exitCode})`;
 }
 
-async function openPullRequest(job, head, base, title, body, draft) {
+async function openPullRequest(job, head, base, title, body, draft, token) {
   const res = await fetch(`https://api.github.com/repos/${job.repo.owner}/${job.repo.repo}/pulls`, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${job.githubToken}`,
+      // Use the token that actually authenticated clone/push — the App token may
+      // 403 on repos it can't reach, while the OAuth fallback works.
+      authorization: `Bearer ${token || job.githubToken}`,
       accept: "application/vnd.github+json",
       "user-agent": "fly-dev",
       "content-type": "application/json",
@@ -347,7 +349,7 @@ async function handleRun(rawBody) {
       `---\n_Opened automatically by fly-dev run ${job.runId}._`;
 
     step(job.runId, "pr:start", { draft });
-    const pr = await openPullRequest(job, branch, baseBranch, title, prBody, draft);
+    const pr = await openPullRequest(job, branch, baseBranch, title, prBody, draft, activeToken);
     step(job.runId, "pr:done", { ok: pr.ok, prNumber: pr.prNumber ?? null, status: pr.status ?? null });
     if (!pr.ok) {
       return {

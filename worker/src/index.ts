@@ -1150,7 +1150,7 @@ async function reapStuckRuns(env: Env): Promise<void> {
     `SELECT id, user_id, project_id, status, last_error, metadata_json
        FROM runs
       WHERE (status = 'failed'  AND finished_at >= datetime('now','-3 hours'))
-         OR (status = 'running' AND started_at  <= datetime('now','-100 minutes'))
+         OR (status = 'running' AND started_at  <= datetime('now','-110 minutes'))
       ORDER BY updated_at ASC
       LIMIT 50`,
   );
