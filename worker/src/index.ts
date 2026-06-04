@@ -1159,15 +1159,18 @@ async function reapStuckRuns(env: Env): Promise<void> {
     env,
     `SELECT id, user_id, project_id, status, last_error, metadata_json
        FROM runs
-      WHERE (status = 'failed'  AND finished_at >= datetime('now','-3 hours'))
+      WHERE (status = 'failed'  AND finished_at >= datetime('now','-6 hours'))
          OR (status = 'running' AND started_at  <= datetime('now','-110 minutes'))
+         OR (status = 'queued'  AND updated_at  <= datetime('now','-15 minutes'))
       ORDER BY updated_at ASC
       LIMIT 50`,
   );
 
   for (const run of candidates) {
-    const stuckRunning = run.status === "running";
-    if (!stuckRunning && !isRetryableError(run.last_error)) continue;
+    // 'running'/'queued' are stuck STATES (lost container / lost queue message),
+    // not error states, so they're always eligible regardless of last_error.
+    const stuckState = run.status === "running" || run.status === "queued";
+    if (!stuckState && !isRetryableError(run.last_error)) continue;
 
     let meta: Record<string, unknown> = {};
     try {
@@ -1194,7 +1197,7 @@ async function reapStuckRuns(env: Env): Promise<void> {
       env,
       run.id,
       "run.retry",
-      `Self-healing: auto-retry ${nextAttempt}/${MAX_RUN_RETRIES} after ${stuckRunning ? "stuck running" : run.last_error}.`,
+      `Self-healing: auto-retry ${nextAttempt}/${MAX_RUN_RETRIES} after ${stuckState ? `stuck ${run.status}` : run.last_error}.`,
       "info",
       { attempt: nextAttempt },
     );
