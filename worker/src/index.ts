@@ -53,6 +53,11 @@ import {
 import { writeBackToLinear } from "./platform/linear";
 import { mergeWhenGreen } from "./platform/github";
 import { continueProject } from "./platform/continue";
+import {
+  MAX_RUN_RETRIES,
+  isRetryableError,
+  shouldRetryNoChanges,
+} from "./platform/reaper-policy";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
 
@@ -1121,29 +1126,11 @@ export default {
   // recoverable error or got stuck mid-flight, so nothing simply sits in `failed`.
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     await reapStuckRuns(env);
+    await releaseOrphanedApprovals(env);
+    await retryNoChangeStragglers(env);
     await reapMergeablePRs(env);
   },
 };
-
-// Errors worth auto-retrying (infra/auth/transient). NOT no_changes (the agent
-// legitimately produced nothing) or no_repository (a config problem a retry can't fix).
-const RETRYABLE_ERRORS = [
-  "clone_failed",
-  "push_failed",
-  "pr_failed",
-  "commit_failed",
-  "no_github_token",
-  "agent_error",
-  "Container /run returned",
-  "exception",
-  "Agent produced no changes",
-];
-const MAX_RUN_RETRIES = 3;
-
-function isRetryableError(lastError: string | null): boolean {
-  if (!lastError) return false;
-  return RETRYABLE_ERRORS.some((needle) => lastError.includes(needle));
-}
 
 async function reapStuckRuns(env: Env): Promise<void> {
   // 1) Recently-failed runs with a retryable error, under the attempt cap.
@@ -1220,6 +1207,107 @@ async function reapStuckRuns(env: Env): Promise<void> {
       projectId: run.project_id ?? undefined,
       action: "start-run",
       attempt: nextAttempt,
+    });
+  }
+}
+
+// Approval-orphan reaper: when human approval is disabled, runs created during the
+// approval era sit in `waiting_approval` forever — the gate that parked them is gone.
+// Release them to `queued` and dispatch, mirroring approveRun (minus the human record).
+async function releaseOrphanedApprovals(env: Env): Promise<void> {
+  if (env.REQUIRE_HUMAN_APPROVAL === "true") return;
+  const orphans = await all<{
+    id: string;
+    user_id: string;
+    project_id: string | null;
+  }>(
+    env,
+    `SELECT id, user_id, project_id
+       FROM runs
+      WHERE status = 'waiting_approval'
+      ORDER BY created_at ASC
+      LIMIT 50`,
+  );
+
+  for (const run of orphans) {
+    // Status-guarded so we never race the approve endpoint or a concurrent tick.
+    const updated = await env.DB.prepare(
+      `UPDATE runs
+          SET status = 'queued', approval_required = 0, approved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'waiting_approval'`,
+    )
+      .bind(run.id)
+      .run();
+    if (!updated.meta.changes) continue;
+
+    await recordRunEvent(
+      env,
+      run.id,
+      "run.auto_released",
+      "Self-healing: approval gating disabled; orphaned run released to the queue.",
+      "info",
+    );
+    await enqueueRun(env, {
+      runId: run.id,
+      userId: run.user_id,
+      projectId: run.project_id ?? undefined,
+      action: "start-run",
+    });
+  }
+}
+
+// no_changes reaper: `no_changes` is normally terminal, but empty output produced
+// during a dead-OAuth-token window was auth — not the work being done. Give each such
+// run EXACTLY ONE recovery retry, marked in metadata so a genuine no-op never loops.
+async function retryNoChangeStragglers(env: Env): Promise<void> {
+  const rows = await all<{
+    id: string;
+    user_id: string;
+    project_id: string | null;
+    metadata_json: string;
+  }>(
+    env,
+    `SELECT id, user_id, project_id, metadata_json
+       FROM runs
+      WHERE status = 'failed' AND last_error = 'no_changes'
+      ORDER BY updated_at ASC
+      LIMIT 50`,
+  );
+
+  for (const run of rows) {
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = JSON.parse(run.metadata_json) as Record<string, unknown>;
+    } catch {
+      meta = {};
+    }
+    if (!shouldRetryNoChanges(meta)) continue;
+    meta.noChangesRetried = true;
+    const nextAttempt = (typeof meta.retryCount === "number" ? meta.retryCount : 0) + 1;
+    meta.retryCount = nextAttempt;
+
+    const updated = await env.DB.prepare(
+      `UPDATE runs
+          SET status = 'queued', last_error = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'failed' AND last_error = 'no_changes'`,
+    )
+      .bind(JSON.stringify(meta), run.id)
+      .run();
+    if (!updated.meta.changes) continue;
+
+    await recordRunEvent(
+      env,
+      run.id,
+      "run.retry",
+      "Self-healing: one-time retry of a no_changes run (possible auth-window empty output).",
+      "info",
+      { attempt: nextAttempt },
+    );
+    await enqueueRun(env, {
+      runId: run.id,
+      userId: run.user_id,
+      projectId: run.project_id ?? undefined,
+      action: "start-run",
     });
   }
 }
