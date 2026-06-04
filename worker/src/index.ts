@@ -54,9 +54,11 @@ import { writeBackToLinear } from "./platform/linear";
 import { mergeWhenGreen } from "./platform/github";
 import { continueProject } from "./platform/continue";
 import {
-  MAX_RUN_RETRIES,
   isRetryableError,
   shouldRetryNoChanges,
+  reapKind,
+  reapBudgetField,
+  reapBudgetCap,
 } from "./platform/reaper-policy";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
@@ -1132,6 +1134,22 @@ export default {
   },
 };
 
+// Monotonic per-run dispatch sequence → a UNIQUE Workflow instance id each re-dispatch
+// (`${runId}-r${seq}`). Workflow.create is idempotent on id, so reusing a suffix — or
+// re-enqueuing with no attempt (bare `${runId}`) after the run already ran once — would
+// silently no-op and the run would never restart. Seed strictly above any prior counter
+// (including the old single-`retryCount` scheme) so a sequence value is never reused.
+function nextDispatchSeq(meta: Record<string, unknown>): number {
+  const prior = Math.max(
+    typeof meta.dispatchSeq === "number" ? (meta.dispatchSeq as number) : 0,
+    typeof meta.retryCount === "number" ? (meta.retryCount as number) : 0,
+    typeof meta.stuckRedispatch === "number" ? (meta.stuckRedispatch as number) : 0,
+  );
+  const seq = prior + 1;
+  meta.dispatchSeq = seq;
+  return seq;
+}
+
 async function reapStuckRuns(env: Env): Promise<void> {
   // 1) Recently-failed runs with a retryable error, under the attempt cap.
   // 2) Runs stuck in `running` well past the agent timeout (container died).
@@ -1154,10 +1172,10 @@ async function reapStuckRuns(env: Env): Promise<void> {
   );
 
   for (const run of candidates) {
-    // 'running'/'queued' are stuck STATES (lost container / lost queue message),
-    // not error states, so they're always eligible regardless of last_error.
-    const stuckState = run.status === "running" || run.status === "queued";
-    if (!stuckState && !isRetryableError(run.last_error)) continue;
+    const kind = reapKind(run.status);
+    // Error retries require a retryable error; stuck states (capacity wait / lost queue
+    // message) are always eligible regardless of last_error.
+    if (kind === "error" && !isRetryableError(run.last_error)) continue;
 
     let meta: Record<string, unknown> = {};
     try {
@@ -1165,8 +1183,13 @@ async function reapStuckRuns(env: Env): Promise<void> {
     } catch {
       meta = {};
     }
-    const attempt = typeof meta.retryCount === "number" ? meta.retryCount : 0;
-    if (attempt >= MAX_RUN_RETRIES) {
+
+    // Error retries and capacity re-dispatches draw from SEPARATE budgets so a backlog
+    // draining through limited slots never falsely fails a run (see reaper-policy).
+    const field = reapBudgetField(kind);
+    const used = typeof meta[field] === "number" ? (meta[field] as number) : 0;
+    const cap = reapBudgetCap(kind);
+    if (used >= cap) {
       // Don't strand it: if it's not already terminal, fail it loudly so it leaves
       // the queue and surfaces for attention. Idempotent via meta.exhausted.
       if (run.status !== "failed" && meta.exhausted !== true) {
@@ -1176,17 +1199,19 @@ async function reapStuckRuns(env: Env): Promise<void> {
         )
           .bind(JSON.stringify(meta), run.id, run.status)
           .run();
-        await recordRunEvent(env, run.id, "run.exhausted", `Auto-retry gave up after ${MAX_RUN_RETRIES} attempts (last: ${run.last_error ?? run.status}). Needs attention.`, "error");
+        await recordRunEvent(env, run.id, "run.exhausted", `Auto-retry gave up after ${cap} ${kind} attempts (last: ${run.last_error ?? run.status}). Needs attention.`, "error");
       }
       continue;
     }
-    const nextAttempt = attempt + 1;
-    meta.retryCount = nextAttempt;
+    meta[field] = used + 1;
+    const seq = nextDispatchSeq(meta);
 
-    // Flip back to queued only if still in the state we read (avoids racing a
-    // concurrently-recovering run).
+    // Reset started_at/finished_at so each attempt gets a FRESH 110-minute running clock.
+    // Otherwise COALESCE(started_at, …) in markRunStarted keeps the original timestamp and
+    // the next tick re-reaps the run as 'stuck running' seconds after it restarts.
+    // Flip only if still in the state we read (avoids racing a concurrent recovery).
     const updated = await env.DB.prepare(
-      `UPDATE runs SET status = 'queued', last_error = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+      `UPDATE runs SET status = 'queued', last_error = NULL, started_at = NULL, finished_at = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND status = ?`,
     )
       .bind(JSON.stringify(meta), run.id, run.status)
@@ -1197,16 +1222,16 @@ async function reapStuckRuns(env: Env): Promise<void> {
       env,
       run.id,
       "run.retry",
-      `Self-healing: auto-retry ${nextAttempt}/${MAX_RUN_RETRIES} after ${stuckState ? `stuck ${run.status}` : run.last_error}.`,
+      `Self-healing: ${kind} re-dispatch ${used + 1}/${cap} after ${kind === "stuck" ? `stuck ${run.status}` : run.last_error}.`,
       "info",
-      { attempt: nextAttempt },
+      { attempt: seq },
     );
     await enqueueRun(env, {
       runId: run.id,
       userId: run.user_id,
       projectId: run.project_id ?? undefined,
       action: "start-run",
-      attempt: nextAttempt,
+      attempt: seq,
     });
   }
 }
@@ -1283,12 +1308,14 @@ async function retryNoChangeStragglers(env: Env): Promise<void> {
     }
     if (!shouldRetryNoChanges(meta)) continue;
     meta.noChangesRetried = true;
-    const nextAttempt = (typeof meta.retryCount === "number" ? meta.retryCount : 0) + 1;
-    meta.retryCount = nextAttempt;
+    // A one-time recovery, bounded by the marker above — it does NOT consume the error
+    // budget. It DOES need a fresh dispatch sequence: the run already ran once on the
+    // bare `${runId}` instance, so re-enqueuing without one would idempotently no-op.
+    const seq = nextDispatchSeq(meta);
 
     const updated = await env.DB.prepare(
       `UPDATE runs
-          SET status = 'queued', last_error = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+          SET status = 'queued', last_error = NULL, started_at = NULL, finished_at = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND status = 'failed' AND last_error = 'no_changes'`,
     )
       .bind(JSON.stringify(meta), run.id)
@@ -1301,13 +1328,14 @@ async function retryNoChangeStragglers(env: Env): Promise<void> {
       "run.retry",
       "Self-healing: one-time retry of a no_changes run (possible auth-window empty output).",
       "info",
-      { attempt: nextAttempt },
+      { attempt: seq },
     );
     await enqueueRun(env, {
       runId: run.id,
       userId: run.user_id,
       projectId: run.project_id ?? undefined,
       action: "start-run",
+      attempt: seq,
     });
   }
 }

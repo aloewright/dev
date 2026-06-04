@@ -4,6 +4,10 @@ import {
   isRetryableError,
   shouldRetryNoChanges,
   MAX_RUN_RETRIES,
+  MAX_STUCK_REDISPATCH,
+  reapKind,
+  reapBudgetField,
+  reapBudgetCap,
 } from "../worker/src/platform/reaper-policy";
 
 describe("isRetryableError", () => {
@@ -34,5 +38,24 @@ describe("shouldRetryNoChanges", () => {
 describe("MAX_RUN_RETRIES", () => {
   it("caps general auto-retries", () => {
     expect(MAX_RUN_RETRIES).toBe(3);
+  });
+});
+
+describe("reap budgets (capacity waits are not failures)", () => {
+  it("classifies queued/running as stuck (capacity) and failed as error", () => {
+    expect(reapKind("queued")).toBe("stuck");
+    expect(reapKind("running")).toBe("stuck");
+    expect(reapKind("failed")).toBe("error");
+  });
+
+  it("routes the two kinds to separate metadata counters", () => {
+    expect(reapBudgetField("stuck")).toBe("stuckRedispatch");
+    expect(reapBudgetField("error")).toBe("retryCount");
+  });
+
+  it("gives capacity re-dispatches a far more generous cap than error retries", () => {
+    expect(reapBudgetCap("error")).toBe(MAX_RUN_RETRIES);
+    expect(reapBudgetCap("stuck")).toBe(MAX_STUCK_REDISPATCH);
+    expect(MAX_STUCK_REDISPATCH).toBeGreaterThan(MAX_RUN_RETRIES);
   });
 });
