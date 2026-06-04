@@ -26,6 +26,7 @@ import {
   backfillLinearProjects,
   clearProjectMapping,
   createOAuthConnectUrl,
+  getDecryptedToken,
   getValidLinearToken,
   getLinearProjectIssues,
   handleOAuthCallback,
@@ -50,6 +51,7 @@ import {
   type CreateTaskPayload,
 } from "./platform/orchestration";
 import { writeBackToLinear } from "./platform/linear";
+import { mergeWhenGreen } from "./platform/github";
 import { continueProject } from "./platform/continue";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
@@ -979,6 +981,8 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
             runId: payload.runId,
             objective: plan.objective,
             agentProvider: plan.agentProvider,
+            mode: plan.mode ?? "implement",
+            prNumber: plan.prNumber,
             repo,
             githubToken: creds.githubToken,
             githubTokens: creds.githubTokens,
@@ -1117,6 +1121,7 @@ export default {
   // recoverable error or got stuck mid-flight, so nothing simply sits in `failed`.
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     await reapStuckRuns(env);
+    await reapMergeablePRs(env);
   },
 };
 
@@ -1200,6 +1205,62 @@ async function reapStuckRuns(env: Env): Promise<void> {
       action: "start-run",
       attempt: nextAttempt,
     });
+  }
+}
+
+// Merge reaper: for completed runs whose PR wasn't merged in-run (e.g. external CI
+// was still pending), re-check the PR and squash-merge once GitHub reports it
+// mergeable with green checks. Tracks attempts/done in run metadata.
+const MAX_MERGE_ATTEMPTS = 24; // ~2h at the 5-min cron cadence
+
+async function reapMergeablePRs(env: Env): Promise<void> {
+  const candidates = await all<{
+    id: string;
+    user_id: string;
+    pr_url: string | null;
+    metadata_json: string;
+  }>(
+    env,
+    `SELECT id, user_id, pr_url, metadata_json
+       FROM runs
+      WHERE status = 'completed' AND pr_url IS NOT NULL
+        AND finished_at >= datetime('now','-12 hours')
+      ORDER BY finished_at DESC
+      LIMIT 30`,
+  );
+
+  for (const run of candidates) {
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = JSON.parse(run.metadata_json) as Record<string, unknown>;
+    } catch {
+      meta = {};
+    }
+    if (meta.mergeDone === true) continue;
+    const attempts = typeof meta.mergeAttempts === "number" ? meta.mergeAttempts : 0;
+    if (attempts >= MAX_MERGE_ATTEMPTS) continue;
+
+    const m = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(run.pr_url ?? "");
+    if (!m) continue;
+    const [, owner, repo, prNum] = m;
+    if (!owner || !repo || !prNum) continue;
+    const token = env.GITHUB_PAT || (await getDecryptedToken(env, run.user_id, "github"));
+    if (!token) continue;
+
+    const result = await mergeWhenGreen(token, owner, repo, Number(prNum)).catch(() => ({
+      merged: false as const,
+      reason: "exception",
+    }));
+    meta.mergeAttempts = attempts + 1;
+    if (result.merged || ("alreadyMerged" in result && result.alreadyMerged)) {
+      meta.mergeDone = true;
+    }
+    await env.DB.prepare("UPDATE runs SET metadata_json = ? WHERE id = ?")
+      .bind(JSON.stringify(meta), run.id)
+      .run();
+    if (result.merged) {
+      await recordRunEvent(env, run.id, "merge.reaped", `PR #${prNum} merged once checks went green.`, "info");
+    }
   }
 }
 

@@ -1,6 +1,6 @@
 /* AGPL-3.0-or-later */
 import type { Env } from "../env";
-import { ensureUser } from "./data";
+import { ensureUser, first } from "./data";
 import { createTaskRun } from "./orchestration";
 
 // Map inbound provider webhooks to task runs. Runs created here still pass
@@ -46,33 +46,91 @@ export async function dispatchFromLinearWebhook(env: Env, payload: Record<string
   });
 }
 
-// GitHub: trigger on an issue/PR comment containing `/claude` or `/codex`.
+// GitHub triggers:
+//  - Comment/review on a PR with `/claude` `/codex` `/fix` `/address` OR a formal
+//    review requesting changes → an `address_pr` run (addresses comments, fixes
+//    tests, resolves conflicts, merges when green).
+//  - Comment on an ISSUE with `/claude` or `/codex` → a fresh implement run.
+// Never acts on the fly-dev bot's own comments (avoids loops).
 export async function dispatchFromGitHubWebhook(env: Env, payload: Record<string, unknown>): Promise<void> {
-  const comment = asObject(payload.comment);
-  const body = stringField(comment, "body");
-  if (!body || !/\/(claude|codex)\b/i.test(body)) return;
-
   const repository = asObject(payload.repository);
   const fullName = stringField(repository, "full_name");
-  const issue = asObject(payload.issue);
-  const title = stringField(issue, "title");
-  if (!fullName || !title) return;
-
+  if (!fullName) return;
   const [owner, repo] = fullName.split("/");
   if (!owner || !repo) return;
 
+  const comment = asObject(payload.comment);
+  const review = asObject(payload.review);
+  const issue = asObject(payload.issue);
+  const pull = asObject(payload.pull_request);
+
+  const author =
+    stringField(asObject(comment.user), "login") ?? stringField(asObject(review.user), "login");
+  // Ignore ALL GitHub App bots (our own + code-review bots like CodeRabbit /
+  // github-actions). Otherwise a bot's review → our push → bot re-review → … loops
+  // forever. Humans still trigger via an explicit /claude /fix /address mention.
+  if (author && /\[bot\]/i.test(author)) return;
+
+  const body = stringField(comment, "body") ?? stringField(review, "body") ?? "";
+  const reviewState = stringField(review, "state");
+
+  // A PR number is present when this is a comment on a PR (issue.pull_request set)
+  // or a pull_request_review(_comment) event (uses payload.pull_request.number).
+  const isPrComment = Object.keys(asObject(issue.pull_request)).length > 0;
+  const prNumber =
+    isPrComment && typeof issue.number === "number"
+      ? (issue.number as number)
+      : typeof pull.number === "number"
+        ? (pull.number as number)
+        : null;
+
+  const mentioned = /\/(claude|codex|fix|address)\b/i.test(body);
+  const provider: "codex" | "claude-code" = /\/codex\b/i.test(body) ? "codex" : "claude-code";
+
+  // PR feedback → address_pr (only one in-flight per PR to avoid racing pushes).
+  if (prNumber && (mentioned || reviewState === "changes_requested")) {
+    const inFlight = await first(
+      env,
+      `SELECT id FROM runs
+        WHERE status IN ('queued','running','waiting_approval')
+          AND metadata_json LIKE ? AND metadata_json LIKE ? LIMIT 1`,
+      [`%"mode":"address_pr"%`, `%"prNumber":${prNumber},%`],
+    );
+    if (inFlight) return;
+    const ask = body.replace(/\/(claude|codex|fix|address)\b/gi, "").trim();
+    const user = await ensureUser(env, {
+      email: null,
+      name: "Fly Webhook",
+      flyUserSlug: "internal",
+      authSource: "internal",
+    });
+    await createTaskRun(env, user, {
+      objective: `Address review feedback on PR #${prNumber}.${ask ? `\n\n${ask}` : ""}`,
+      repoOwner: owner,
+      repoName: repo,
+      mode: "address_pr",
+      prNumber,
+      agentProvider: provider,
+      source: "github-pr-comment",
+    });
+    return;
+  }
+
+  // Issue comment with an explicit trigger → fresh implement run.
+  if (!mentioned || !/\/(claude|codex)\b/i.test(body)) return;
+  const title = stringField(issue, "title");
+  if (!title) return;
   const user = await ensureUser(env, {
     email: null,
     name: "Fly Webhook",
     flyUserSlug: "internal",
     authSource: "internal",
   });
-
   await createTaskRun(env, user, {
     objective: `${title}\n\n${body.replace(/\/(claude|codex)\b/gi, "").trim()}`.trim(),
     repoOwner: owner,
     repoName: repo,
-    agentProvider: /\/codex\b/i.test(body) ? "codex" : "claude-code",
+    agentProvider: provider,
     source: "github-webhook",
   });
 }

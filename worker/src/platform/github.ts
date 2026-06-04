@@ -46,6 +46,79 @@ export async function getInstallationToken(
   return token ?? null;
 }
 
+type MergeOutcome = { merged: boolean; alreadyMerged?: boolean; reason: string };
+
+// Squash-merge a PR ONLY when GitHub reports it open, non-draft, mergeable=true,
+// and its checks are neither failing nor pending. Safe to call repeatedly from a
+// cron reaper — it polls toward green and is a no-op once merged.
+export async function mergeWhenGreen(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<MergeOutcome> {
+  const headers = {
+    authorization: `Bearer ${token}`,
+    accept: "application/vnd.github+json",
+    "user-agent": "fly-dev",
+    "x-github-api-version": "2022-11-28",
+  };
+  const base = `https://api.github.com/repos/${owner}/${repo}`;
+  const prRes = await fetch(`${base}/pulls/${prNumber}`, { headers });
+  if (!prRes.ok) return { merged: false, reason: `pr_http_${prRes.status}` };
+  const pr = (await prRes.json()) as {
+    merged?: boolean;
+    mergeable?: boolean | null;
+    draft?: boolean;
+    state?: string;
+    head?: { sha?: string };
+  };
+  if (pr.merged) return { merged: false, alreadyMerged: true, reason: "already_merged" };
+  if (pr.state !== "open") return { merged: false, alreadyMerged: true, reason: `state_${pr.state}` };
+  if (pr.draft) return { merged: false, reason: "draft" };
+  if (pr.mergeable !== true) return { merged: false, reason: "not_mergeable" };
+
+  const sha = pr.head?.sha;
+  if (!sha) return { merged: false, reason: "no_sha" };
+  const checks = await combinedChecksState(base, sha, headers);
+  if (checks === "failure") return { merged: false, reason: "checks_failing" };
+  if (checks === "pending") return { merged: false, reason: "checks_pending" };
+
+  const mergeRes = await fetch(`${base}/pulls/${prNumber}/merge`, {
+    method: "PUT",
+    headers: { ...headers, "content-type": "application/json" },
+    // Always SHA-lock so GitHub rejects (409) a merge if the branch advanced since
+    // we verified its checks.
+    body: JSON.stringify({ merge_method: "squash", sha }),
+  });
+  if (mergeRes.ok) return { merged: true, reason: "merged" };
+  // 405 = not mergeable now (already merged / closed / lost a race). Treat as done.
+  if (mergeRes.status === 405) return { merged: false, alreadyMerged: true, reason: "merge_405" };
+  return { merged: false, reason: `merge_http_${mergeRes.status}` };
+}
+
+async function combinedChecksState(
+  base: string,
+  sha: string,
+  headers: Record<string, string>,
+): Promise<"success" | "pending" | "failure"> {
+  const cr = (await fetch(`${base}/commits/${sha}/check-runs`, { headers })
+    .then((r) => (r.ok ? r.json() : { check_runs: [] }))
+    .catch(() => ({ check_runs: [] }))) as { check_runs?: Array<{ status?: string; conclusion?: string | null }> };
+  const st = (await fetch(`${base}/commits/${sha}/status`, { headers })
+    .then((r) => (r.ok ? r.json() : { state: "" }))
+    .catch(() => ({ state: "" }))) as { state?: string };
+  const runs = cr.check_runs ?? [];
+  const failed =
+    st.state === "failure" ||
+    runs.some((r) =>
+      ["failure", "timed_out", "cancelled", "action_required", "startup_failure"].includes(r.conclusion ?? ""),
+    );
+  if (failed) return "failure";
+  const pending = st.state === "pending" || runs.some((r) => r.status !== "completed");
+  return pending ? "pending" : "success";
+}
+
 function ghHeaders(bearer: string): Record<string, string> {
   return {
     authorization: `Bearer ${bearer}`,

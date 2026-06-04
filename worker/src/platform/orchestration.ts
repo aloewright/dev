@@ -17,6 +17,10 @@ export type CreateTaskPayload = {
   agentProvider?: "codex" | "claude-code";
   autonomyMode?: "manual_approval" | "auto_review" | "auto_eligible";
   source?: string;
+  // "address_pr" runs check out an existing PR (prNumber) and address its review
+  // comments instead of implementing a fresh objective.
+  mode?: "implement" | "address_pr";
+  prNumber?: number;
 };
 
 export type CreateTemplateAppPayload = {
@@ -37,6 +41,8 @@ export type RunPlan = {
   repo: RunRepoCoords | null;
   linearIssueId: string | null;
   linearTeamId: string | null;
+  mode: string | null;
+  prNumber: number | null;
 };
 
 export async function createTaskRun(env: Env, user: CurrentUser, payload: CreateTaskPayload) {
@@ -72,6 +78,8 @@ export async function createTaskRun(env: Env, user: CurrentUser, payload: Create
       payload.linearTeamId ?? null,
       JSON.stringify({
         source: payload.source ?? "dev.fly.pm",
+        mode: payload.mode ?? null,
+        prNumber: payload.prNumber ?? null,
         linearIssueId: payload.linearIssueId ?? null,
         linearTeamId: payload.linearTeamId ?? null,
         repoOwner: payload.repoOwner ?? null,
@@ -304,6 +312,8 @@ export async function resolveRunPlan(env: Env, runId: string): Promise<RunPlan |
     repo,
     linearIssueId: typeof meta.linearIssueId === "string" ? meta.linearIssueId : null,
     linearTeamId: typeof meta.linearTeamId === "string" ? meta.linearTeamId : null,
+    mode: typeof meta.mode === "string" ? meta.mode : null,
+    prNumber: typeof meta.prNumber === "number" ? meta.prNumber : null,
   };
 }
 
