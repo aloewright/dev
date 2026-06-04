@@ -246,7 +246,11 @@ async function handleRun(rawBody) {
   // OAuth fallback. The App installation token can 403 on private repos it isn't
   // installed on; the user's OAuth token has full `repo` access. We pick whichever
   // authenticates the clone and reuse it for the push.
-  const tokens = [job.githubToken, job.githubFallbackToken].filter(Boolean);
+  const tokens = (
+    Array.isArray(job.githubTokens) && job.githubTokens.length
+      ? job.githubTokens
+      : [job.githubToken]
+  ).filter(Boolean);
   const repoPath = `github.com/${job.repo.owner}/${job.repo.repo}.git`;
   const cloneUrlFor = (tok) => `https://x-access-token:${tok}@${repoPath}`;
 

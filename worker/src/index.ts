@@ -978,7 +978,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
             agentProvider: plan.agentProvider,
             repo,
             githubToken: creds.githubToken,
-            githubFallbackToken: creds.githubFallbackToken,
+            githubTokens: creds.githubTokens,
             linearToken: creds.linearToken,
             aiGateway: creds.aiGateway,
             claudeOauthToken: creds.claudeOauthToken,

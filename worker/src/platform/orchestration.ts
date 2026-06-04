@@ -314,30 +314,30 @@ export async function prepareRunCredentials(
   plan: RunPlan,
 ): Promise<{
   githubToken: string | null;
-  githubFallbackToken: string | null;
+  githubTokens: string[];
   linearToken: string | null;
   aiGateway: { url: string; token: string } | null;
   claudeOauthToken: string | null;
 }> {
-  // The user's OAuth token has full `repo` access to all their repositories.
   const oauthToken = await getDecryptedToken(env, plan.userId, "github");
-  let githubToken = oauthToken;
 
-  // Prefer a least-privilege GitHub App installation token scoped to the single
-  // repo over the broad user OAuth token (SANDBOX_REVIEW.md S3). BUT the App may not
-  // be installed on (or lack contents for) a given private repo, in which case the
-  // installation token 403s on clone/push — so we ALSO pass the OAuth token as a
-  // fallback and the sandbox retries git ops with it on an auth failure.
+  // A least-privilege GitHub App installation token scoped to the single repo
+  // (SANDBOX_REVIEW.md S3) — but the App may not be installed on / lack contents for
+  // a given private repo (→ 403 on clone/push).
+  let appToken: string | null = null;
   if (plan.repo && env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY) {
-    const installationToken = await getInstallationToken(env, plan.repo.owner, plan.repo.repo).catch(
-      () => null,
-    );
-    if (installationToken) {
-      githubToken = installationToken;
-    }
+    appToken = await getInstallationToken(env, plan.repo.owner, plan.repo.repo).catch(() => null);
   }
-  // Only worth a distinct fallback when the primary is the (restricted) App token.
-  const githubFallbackToken = oauthToken && oauthToken !== githubToken ? oauthToken : null;
+
+  // Candidate tokens for git ops, in order of preference: least-privilege App token,
+  // then the broad PAT (reads+writes all repos), then the user OAuth token. The
+  // sandbox tries each until clone authenticates and reuses the winner for push/PR.
+  // The PAT is essential because the App token 403s on repos it can't reach and the
+  // user OAuth token can have empty scopes.
+  const githubTokens = [appToken, env.GITHUB_PAT ?? null, oauthToken].filter(
+    (t, idx, arr): t is string => Boolean(t) && arr.indexOf(t) === idx,
+  );
+  const githubToken = githubTokens[0] ?? null;
 
   const linearToken = await getValidLinearToken(env, plan.userId);
 
@@ -356,7 +356,7 @@ export async function prepareRunCredentials(
   // — the gateway only proxies API-key auth, not OAuth/subscription auth.
   const claudeOauthToken = env.CLAUDE_CODE_OAUTH_TOKEN ?? null;
 
-  return { githubToken, githubFallbackToken, linearToken, aiGateway, claudeOauthToken };
+  return { githubToken, githubTokens, linearToken, aiGateway, claudeOauthToken };
 }
 
 async function resolveRepoCoords(
