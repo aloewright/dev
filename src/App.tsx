@@ -491,21 +491,6 @@ export function App() {
                 ) : null}
               </Stack>
             </Card>
-
-            <Card withBorder radius="md" padding={0}>
-              <Box px="lg" py="sm" style={sectionHeader}>
-                <Title order={2} size="h4">
-                  Recent Runs
-                </Title>
-              </Box>
-              <Stack gap={0}>
-                {(overview?.recentRuns ?? []).length > 0 ? (
-                  overview!.recentRuns.map((run) => <RunRow key={run.id} run={run} />)
-                ) : (
-                  <EmptyRow label="No runs queued" />
-                )}
-              </Stack>
-            </Card>
           </Stack>
 
           <Stack gap="lg">
@@ -556,6 +541,13 @@ export function App() {
                           >
                             Sync
                           </Button>
+                          <Button
+                            size="xs"
+                            variant="light"
+                            onClick={() => startConnect(provider.id)}
+                          >
+                            Reconnect
+                          </Button>
                         </Group>
                       ) : (
                         <Button
@@ -569,6 +561,21 @@ export function App() {
                     </Group>
                   );
                 })}
+              </Stack>
+            </Card>
+
+            <Card withBorder radius="md" padding={0}>
+              <Box px="lg" py="sm" style={sectionHeader}>
+                <Title order={2} size="h4">
+                  Recent Runs
+                </Title>
+              </Box>
+              <Stack gap={0}>
+                {(overview?.recentRuns ?? []).length > 0 ? (
+                  overview!.recentRuns.map((run) => <RunRow key={run.id} run={run} />)
+                ) : (
+                  <EmptyRow label="No runs queued" />
+                )}
               </Stack>
             </Card>
 

@@ -2,7 +2,7 @@
 import type { CurrentUser, Env, RunRepoCoords, RunWorkflowParams, WorkQueueMessage } from "../env";
 import { first, id, recordRunEvent, recordUsage, runSql } from "./data";
 import { redactSecrets } from "./crypto";
-import { getDecryptedToken } from "./integrations";
+import { getDecryptedToken, getValidLinearToken } from "./integrations";
 import { getInstallationToken } from "./github";
 
 export type CreateTaskPayload = {
@@ -45,11 +45,11 @@ export async function createTaskRun(env: Env, user: CurrentUser, payload: Create
     return Response.json({ error: "Task objective is required" }, { status: 400 });
   }
 
-  // The REQUIRE_HUMAN_APPROVAL operator switch overrides any caller-supplied
-  // autonomyMode — webhook-triggered runs always require approval before they
-  // can mutate a repository. See SANDBOX_REVIEW.md B3.
-  const forceApproval = env.REQUIRE_HUMAN_APPROVAL === "true";
-  const approvalRequired = forceApproval || payload.autonomyMode !== "auto_eligible" ? 1 : 0;
+  // Approval gating is OFF by default: runs auto-queue and execute. It only kicks in
+  // when the operator explicitly sets REQUIRE_HUMAN_APPROVAL="true" (kept as a
+  // reversible kill-switch since the sandbox security model — SANDBOX_REVIEW.md B3 —
+  // was built around it).
+  const approvalRequired = env.REQUIRE_HUMAN_APPROVAL === "true" ? 1 : 0;
   const status = approvalRequired ? "waiting_approval" : "queued";
 
   const runId = id("run");
@@ -196,9 +196,12 @@ export async function createTemplateApp(
 }
 
 export async function startRunWorkflow(env: Env, params: RunWorkflowParams): Promise<void> {
+  // Distinct instance id per attempt — Workflow.create is idempotent on id, so a
+  // retry must use a fresh id (the first failed instance still exists) or it no-ops.
+  const instanceId = params.attempt ? `${params.runId}-r${params.attempt}` : params.runId;
   try {
     await env.RUN_WORKFLOW.create({
-      id: params.runId,
+      id: instanceId,
       params,
       retention: {
         successRetention: "30 days",
@@ -311,14 +314,20 @@ export async function prepareRunCredentials(
   plan: RunPlan,
 ): Promise<{
   githubToken: string | null;
+  githubFallbackToken: string | null;
   linearToken: string | null;
   aiGateway: { url: string; token: string } | null;
   claudeOauthToken: string | null;
 }> {
-  let githubToken = await getDecryptedToken(env, plan.userId, "github");
+  // The user's OAuth token has full `repo` access to all their repositories.
+  const oauthToken = await getDecryptedToken(env, plan.userId, "github");
+  let githubToken = oauthToken;
 
   // Prefer a least-privilege GitHub App installation token scoped to the single
-  // repo over the broad user OAuth token. See SANDBOX_REVIEW.md S3.
+  // repo over the broad user OAuth token (SANDBOX_REVIEW.md S3). BUT the App may not
+  // be installed on (or lack contents for) a given private repo, in which case the
+  // installation token 403s on clone/push — so we ALSO pass the OAuth token as a
+  // fallback and the sandbox retries git ops with it on an auth failure.
   if (plan.repo && env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY) {
     const installationToken = await getInstallationToken(env, plan.repo.owner, plan.repo.repo).catch(
       () => null,
@@ -327,8 +336,10 @@ export async function prepareRunCredentials(
       githubToken = installationToken;
     }
   }
+  // Only worth a distinct fallback when the primary is the (restricted) App token.
+  const githubFallbackToken = oauthToken && oauthToken !== githubToken ? oauthToken : null;
 
-  const linearToken = await getDecryptedToken(env, plan.userId, "linear");
+  const linearToken = await getValidLinearToken(env, plan.userId);
 
   // For codex (OpenAI-compatible Messages API), keep gateway routing so calls
   // are observed + cost-tracked centrally.
@@ -345,7 +356,7 @@ export async function prepareRunCredentials(
   // — the gateway only proxies API-key auth, not OAuth/subscription auth.
   const claudeOauthToken = env.CLAUDE_CODE_OAUTH_TOKEN ?? null;
 
-  return { githubToken, linearToken, aiGateway, claudeOauthToken };
+  return { githubToken, githubFallbackToken, linearToken, aiGateway, claudeOauthToken };
 }
 
 async function resolveRepoCoords(

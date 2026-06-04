@@ -4,6 +4,9 @@ export type WorkQueueMessage = {
   userId: string;
   projectId?: string;
   action: "start-run" | "sync-project" | "deploy-page";
+  // Retry attempt number (0/undefined = first run). Gives each retry a distinct
+  // Workflow instance id so re-running a failed run actually starts.
+  attempt?: number;
 };
 
 export type RunWorkflowParams = {
@@ -11,6 +14,7 @@ export type RunWorkflowParams = {
   userId: string;
   projectId?: string;
   objective: string;
+  attempt?: number;
 };
 
 // Repository coordinates resolved for a run (non-secret).

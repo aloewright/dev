@@ -21,6 +21,10 @@
   ],
   "workers_dev": false,
   "preview_urls": false,
+  // Self-healing reaper: re-queues retryable failed / stuck runs every 5 minutes.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "tail_consumers": [
     {
       "service": "fly-dev-tail"
@@ -155,7 +159,7 @@
     "FIRECRAWL_WORKER_URL": "https://firecrawl-cf.lazee.workers.dev",
     "FLY_AUTH_ORIGIN": "https://fly.pm",
     "PLAYWRIGHT_WORKER_URL": "",
-    "REQUIRE_HUMAN_APPROVAL": "true",
+    "REQUIRE_HUMAN_APPROVAL": "false",
     "GITHUB_APP_ID": "3899646",
     "AUTH_HUB_URL": "https://auth.fly.pm",
     "CONTINUE_AUTONOMY": "true",

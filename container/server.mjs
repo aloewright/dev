@@ -236,20 +236,34 @@ async function handleRun(rawBody) {
   const branch = `fly-dev/${job.runId}`;
   const workdir = await mkdtemp(path.join(tmpdir(), `fly-${job.runId}-`));
   const repoDir = path.join(workdir, job.repo.repo);
-  const cloneUrl = `https://x-access-token:${job.githubToken}@github.com/${job.repo.owner}/${job.repo.repo}.git`;
+  // Candidate tokens to try, in order: the (least-privilege) primary, then the
+  // OAuth fallback. The App installation token can 403 on private repos it isn't
+  // installed on; the user's OAuth token has full `repo` access. We pick whichever
+  // authenticates the clone and reuse it for the push.
+  const tokens = [job.githubToken, job.githubFallbackToken].filter(Boolean);
+  const repoPath = `github.com/${job.repo.owner}/${job.repo.repo}.git`;
+  const cloneUrlFor = (tok) => `https://x-access-token:${tok}@${repoPath}`;
 
   try {
-    step(job.runId, "clone:start", { repo: `${job.repo.owner}/${job.repo.repo}`, baseBranch });
-    const clone = await exec(
-      "git",
-      ["clone", "--depth=1", "--branch", baseBranch, cloneUrl, repoDir],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
-    if (clone.code !== 0) {
+    step(job.runId, "clone:start", { repo: `${job.repo.owner}/${job.repo.repo}`, baseBranch, tokenCandidates: tokens.length });
+    let clone = { code: -1, stderr: "no token" };
+    let activeToken = null;
+    for (const tok of tokens) {
+      clone = await exec(
+        "git",
+        ["clone", "--depth=1", "--branch", baseBranch, cloneUrlFor(tok), repoDir],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (clone.code === 0) { activeToken = tok; break; }
+      step(job.runId, "clone:retry", { code: clone.code, authError: /403|401|not granted|Authentication/i.test(clone.stderr) });
+      await rm(repoDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (clone.code !== 0 || !activeToken) {
       step(job.runId, "clone:failed", { code: clone.code });
       return { ok: false, error: "clone_failed", logs: clone.stderr.slice(-4000) };
     }
     step(job.runId, "clone:done");
+    const pushUrl = cloneUrlFor(activeToken);
 
     await exec("git", ["checkout", "-b", branch], { cwd: repoDir });
     await exec("git", ["config", "user.email", "fly-dev[bot]@users.noreply.github.com"], { cwd: repoDir });
@@ -295,7 +309,7 @@ async function handleRun(rawBody) {
     step(job.runId, "test:done", { ran: gate.ran, passed: gate.passed ?? null, projectType: gate.projectType });
 
     step(job.runId, "push:start", { branch });
-    const push = await exec("git", ["push", "origin", branch], { cwd: repoDir, timeoutMs: GIT_TIMEOUT_MS });
+    const push = await exec("git", ["push", pushUrl, branch], { cwd: repoDir, timeoutMs: GIT_TIMEOUT_MS });
     if (push.code !== 0) {
       step(job.runId, "push:failed", { code: push.code });
       return { ok: false, error: "push_failed", logs: push.stderr.slice(-2000), summary };

@@ -39,6 +39,7 @@ import {
   approveRun,
   cancelRun,
   createTaskRun,
+  enqueueRun,
   createTemplateApp,
   markRunCompleted,
   markRunFailed,
@@ -977,6 +978,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
             agentProvider: plan.agentProvider,
             repo,
             githubToken: creds.githubToken,
+            githubFallbackToken: creds.githubFallbackToken,
             linearToken: creds.linearToken,
             aiGateway: creds.aiGateway,
             claudeOauthToken: creds.claudeOauthToken,
@@ -1087,6 +1089,7 @@ export default {
             userId: message.body.userId,
             projectId: message.body.projectId,
             objective: run?.objective ?? "Continue queued fly-dev run",
+            attempt: message.body.attempt,
           });
           message.ack();
         } else {
@@ -1100,7 +1103,95 @@ export default {
       }
     }
   },
+
+  // Self-healing reaper (cron). Re-queues runs that failed with a transient/
+  // recoverable error or got stuck mid-flight, so nothing simply sits in `failed`.
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await reapStuckRuns(env);
+  },
 };
+
+// Errors worth auto-retrying (infra/auth/transient). NOT no_changes (the agent
+// legitimately produced nothing) or no_repository (a config problem a retry can't fix).
+const RETRYABLE_ERRORS = [
+  "clone_failed",
+  "push_failed",
+  "pr_failed",
+  "commit_failed",
+  "no_github_token",
+  "Container /run returned",
+  "exception",
+  "Agent produced no changes",
+];
+const MAX_RUN_RETRIES = 3;
+
+function isRetryableError(lastError: string | null): boolean {
+  if (!lastError) return false;
+  return RETRYABLE_ERRORS.some((needle) => lastError.includes(needle));
+}
+
+async function reapStuckRuns(env: Env): Promise<void> {
+  // 1) Recently-failed runs with a retryable error, under the attempt cap.
+  // 2) Runs stuck in `running` well past the agent timeout (container died).
+  const candidates = await all<{
+    id: string;
+    user_id: string;
+    project_id: string | null;
+    status: string;
+    last_error: string | null;
+    metadata_json: string;
+  }>(
+    env,
+    `SELECT id, user_id, project_id, status, last_error, metadata_json
+       FROM runs
+      WHERE (status = 'failed'  AND finished_at >= datetime('now','-3 hours'))
+         OR (status = 'running' AND started_at  <= datetime('now','-100 minutes'))
+      ORDER BY updated_at ASC
+      LIMIT 50`,
+  );
+
+  for (const run of candidates) {
+    const stuckRunning = run.status === "running";
+    if (!stuckRunning && !isRetryableError(run.last_error)) continue;
+
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = JSON.parse(run.metadata_json) as Record<string, unknown>;
+    } catch {
+      meta = {};
+    }
+    const attempt = typeof meta.retryCount === "number" ? meta.retryCount : 0;
+    if (attempt >= MAX_RUN_RETRIES) continue;
+    const nextAttempt = attempt + 1;
+    meta.retryCount = nextAttempt;
+
+    // Flip back to queued only if still in the state we read (avoids racing a
+    // concurrently-recovering run).
+    const updated = await env.DB.prepare(
+      `UPDATE runs SET status = 'queued', last_error = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = ?`,
+    )
+      .bind(JSON.stringify(meta), run.id, run.status)
+      .run();
+    if (!updated.meta.changes) continue;
+
+    await recordRunEvent(
+      env,
+      run.id,
+      "run.retry",
+      `Self-healing: auto-retry ${nextAttempt}/${MAX_RUN_RETRIES} after ${stuckRunning ? "stuck running" : run.last_error}.`,
+      "info",
+      { attempt: nextAttempt },
+    );
+    await enqueueRun(env, {
+      runId: run.id,
+      userId: run.user_id,
+      projectId: run.project_id ?? undefined,
+      action: "start-run",
+      attempt: nextAttempt,
+    });
+  }
+}
 
 function isOAuthProvider(value: string): value is OAuthProvider {
   return value === "github" || value === "linear";
