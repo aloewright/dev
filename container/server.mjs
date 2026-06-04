@@ -232,7 +232,8 @@ async function handleRun(rawBody) {
     return { ok: false, error: "missing_required_fields" };
   }
 
-  const baseBranch = job.repo.baseBranch || "main";
+  // Detected from the clone — never assume "main" (many repos default to master).
+  let baseBranch = job.repo.baseBranch || "main";
   const branch = `fly-dev/${job.runId}`;
   const workdir = await mkdtemp(path.join(tmpdir(), `fly-${job.runId}-`));
   const repoDir = path.join(workdir, job.repo.repo);
@@ -249,9 +250,10 @@ async function handleRun(rawBody) {
     let clone = { code: -1, stderr: "no token" };
     let activeToken = null;
     for (const tok of tokens) {
+      // No --branch: clone the repo's DEFAULT branch (main, master, develop, …).
       clone = await exec(
         "git",
-        ["clone", "--depth=1", "--branch", baseBranch, cloneUrlFor(tok), repoDir],
+        ["clone", "--depth=1", cloneUrlFor(tok), repoDir],
         { timeoutMs: GIT_TIMEOUT_MS },
       );
       if (clone.code === 0) { activeToken = tok; break; }
@@ -262,7 +264,10 @@ async function handleRun(rawBody) {
       step(job.runId, "clone:failed", { code: clone.code });
       return { ok: false, error: "clone_failed", logs: clone.stderr.slice(-4000) };
     }
-    step(job.runId, "clone:done");
+    // Record the actual default branch we landed on (used as PR base + diff base).
+    const headRef = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir });
+    baseBranch = (headRef.stdout || "").trim() || baseBranch;
+    step(job.runId, "clone:done", { baseBranch });
     const pushUrl = cloneUrlFor(activeToken);
 
     await exec("git", ["checkout", "-b", branch], { cwd: repoDir });
