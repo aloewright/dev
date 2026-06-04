@@ -103,7 +103,7 @@ function agentCommand(job, prompt) {
   }
   return {
     cmd: "claude",
-    args: ["--print", "--permission-mode", "bypassPermissions", "--max-turns", "250", prompt],
+    args: ["--print", "--permission-mode", "bypassPermissions", "--model", "claude-sonnet-4-6", "--effort", "medium", "--max-turns", "250", prompt],
   };
 }
 

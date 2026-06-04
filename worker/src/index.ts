@@ -1179,7 +1179,20 @@ async function reapStuckRuns(env: Env): Promise<void> {
       meta = {};
     }
     const attempt = typeof meta.retryCount === "number" ? meta.retryCount : 0;
-    if (attempt >= MAX_RUN_RETRIES) continue;
+    if (attempt >= MAX_RUN_RETRIES) {
+      // Don't strand it: if it's not already terminal, fail it loudly so it leaves
+      // the queue and surfaces for attention. Idempotent via meta.exhausted.
+      if (run.status !== "failed" && meta.exhausted !== true) {
+        meta.exhausted = true;
+        await env.DB.prepare(
+          `UPDATE runs SET status='failed', last_error='retries_exhausted', finished_at=CURRENT_TIMESTAMP, metadata_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`,
+        )
+          .bind(JSON.stringify(meta), run.id, run.status)
+          .run();
+        await recordRunEvent(env, run.id, "run.exhausted", `Auto-retry gave up after ${MAX_RUN_RETRIES} attempts (last: ${run.last_error ?? run.status}). Needs attention.`, "error");
+      }
+      continue;
+    }
     const nextAttempt = attempt + 1;
     meta.retryCount = nextAttempt;
 
@@ -1255,6 +1268,14 @@ async function reapMergeablePRs(env: Env): Promise<void> {
       reason: "exception",
     }));
     meta.mergeAttempts = attempts + 1;
+    if (result.reason === "draft" || result.reason === "tests_failing") {
+      const draftAttempts = (typeof meta.draftAttempts === "number" ? meta.draftAttempts : 0) + 1;
+      meta.draftAttempts = draftAttempts;
+      if (draftAttempts >= 3) {
+        meta.mergeDone = true; // stop polling; it won't merge until a human/agent fixes it
+        await recordRunEvent(env, run.id, "merge.parked", `PR #${prNum} is a draft / tests failing after ${draftAttempts} checks — parked, needs attention.`, "warn");
+      }
+    }
     if (result.merged || ("alreadyMerged" in result && result.alreadyMerged)) {
       meta.mergeDone = true;
     }
