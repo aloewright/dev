@@ -60,11 +60,11 @@ export function App() {
               <StatusRow label="Worker health" value={isHealthy ? "ok" : "loading"} />
               <StatusRow
                 label="Signed-out user"
-                value={meQuery.data ? meQuery.data.email : "null"}
+                value={meQuery.isLoading ? "loading" : (meQuery.data?.email ?? "null")}
               />
               <StatusRow
                 label="API route"
-                value={healthQuery.data ? healthQuery.data.service : "/api/health"}
+                value={healthQuery.isLoading ? "loading" : (healthQuery.data?.service ?? "/api/health")}
               />
             </aside>
           </div>
