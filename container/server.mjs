@@ -8,7 +8,7 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -19,6 +19,10 @@ const AGENT_TIMEOUT_MS = 90 * 60 * 1000;
 const GIT_TIMEOUT_MS = 2 * 60 * 1000;
 const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
 const TEST_TIMEOUT_MS = 5 * 60 * 1000;
+// How many times the agent may re-attempt to make a failing suite pass.
+const MAX_FIX_ATTEMPTS = 3;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function sendJson(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
@@ -93,14 +97,41 @@ function buildAgentEnv(job) {
   return env;
 }
 
-function agentCommand(job) {
+function agentCommand(job, prompt) {
   if (job.agentProvider === "codex") {
-    return { cmd: "codex", args: ["exec", "--full-auto", job.objective] };
+    return { cmd: "codex", args: ["exec", "--full-auto", prompt] };
   }
   return {
     cmd: "claude",
-    args: ["--print", "--permission-mode", "bypassPermissions", "--max-turns", "250", job.objective],
+    args: ["--print", "--permission-mode", "bypassPermissions", "--max-turns", "250", prompt],
   };
+}
+
+// Run the coding agent with an arbitrary prompt against the working tree.
+async function runAgent(job, repoDir, prompt) {
+  const { cmd, args } = agentCommand(job, prompt);
+  return exec(cmd, args, { cwd: repoDir, env: buildAgentEnv(job), timeoutMs: AGENT_TIMEOUT_MS });
+}
+
+// Stage + commit everything (no-op-safe: returns false when there was nothing to
+// commit). Used after each agent pass.
+async function commitAll(repoDir, message) {
+  await exec("git", ["add", "-A"], { cwd: repoDir });
+  const res = await exec("git", ["commit", "-m", message], { cwd: repoDir });
+  return res.code === 0;
+}
+
+// Guard against committing dependency/build artifacts created by the test gate
+// (the agent fix loop runs `git add -A` AFTER install). Local-only, never pushed.
+function writeGitExclude(repoDir) {
+  try {
+    appendFileSync(
+      path.join(repoDir, ".git", "info", "exclude"),
+      "\nnode_modules/\n.venv/\nvenv/\n__pycache__/\n*.pyc\n.pytest_cache/\n.mypy_cache/\n.tox/\n*.egg-info/\ntarget/\n.cache/\n.gradle/\ncoverage/\n.next/\n.nuxt/\n",
+    );
+  } catch {
+    /* best-effort */
+  }
 }
 
 // Detect how to install + test the project. Returns null for unknown types, and
@@ -226,6 +257,217 @@ async function openPullRequest(job, head, base, title, body, draft, token) {
   return { ok: true, prUrl: json.html_url, prNumber: json.number };
 }
 
+// Run the test gate; if it fails, have the agent fix it and re-test, up to
+// MAX_FIX_ATTEMPTS. Commits each fix attempt. Returns the final gate verdict.
+async function ensureTestsPass(job, repoDir) {
+  let gate = await runTestGate(repoDir);
+  step(job.runId, "test:done", { ran: gate.ran, passed: gate.passed ?? null, projectType: gate.projectType });
+  let attempt = 0;
+  while (gate.ran === true && gate.passed === false && attempt < MAX_FIX_ATTEMPTS) {
+    attempt += 1;
+    step(job.runId, "test:fix", { attempt });
+    const prompt =
+      `The project's test suite is FAILING. Make the failing tests pass by fixing the ` +
+      `implementation (and the tests themselves only where they are genuinely wrong). ` +
+      `Do NOT delete, skip, or weaken tests just to make them pass. Then stop.\n\n` +
+      `Test output:\n${tail(gate.summary, 5000)}`;
+    await runAgent(job, repoDir, prompt);
+    await commitAll(repoDir, `fix: make tests pass (attempt ${attempt}) [fly-dev run ${job.runId}]`);
+    gate = await runTestGate(repoDir);
+    step(job.runId, "test:retry", { attempt, passed: gate.passed ?? null });
+  }
+  return gate;
+}
+
+// GitHub REST helper scoped to the job's repo.
+function ghApi(job, token, suffix, init = {}) {
+  return fetch(`https://api.github.com/repos/${job.repo.owner}/${job.repo.repo}/${suffix}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${token || job.githubToken}`,
+      accept: "application/vnd.github+json",
+      "user-agent": "fly-dev",
+      "content-type": "application/json",
+      "x-github-api-version": "2022-11-28",
+      ...(init.headers || {}),
+    },
+  });
+}
+
+// Combined CI state for a commit: "success" (incl. no checks), "pending", "failure".
+async function combinedChecks(job, token, sha) {
+  const cr = await ghApi(job, token, `commits/${sha}/check-runs`)
+    .then((r) => (r.ok ? r.json() : { check_runs: [] }))
+    .catch(() => ({ check_runs: [] }));
+  const st = await ghApi(job, token, `commits/${sha}/status`)
+    .then((r) => (r.ok ? r.json() : { state: "" }))
+    .catch(() => ({ state: "" }));
+  const runs = cr.check_runs || [];
+  const failed =
+    st.state === "failure" ||
+    runs.some((r) => ["failure", "timed_out", "cancelled", "action_required", "startup_failure"].includes(r.conclusion));
+  if (failed) return "failure";
+  const pending = st.state === "pending" || runs.some((r) => r.status !== "completed");
+  return pending ? "pending" : "success";
+}
+
+// PR mergeability snapshot. GitHub computes `mergeable` asynchronously, so poll briefly.
+async function prMergeStatus(job, token, prNumber) {
+  let pr = null;
+  for (let i = 0; i < 5; i += 1) {
+    const res = await ghApi(job, token, `pulls/${prNumber}`);
+    if (!res.ok) return { ok: false, reason: `pr_get_${res.status}` };
+    pr = await res.json();
+    if (pr.mergeable !== null && pr.mergeable_state !== "unknown") break;
+    await sleep(2000);
+  }
+  const sha = pr.head?.sha;
+  const checks = sha ? await combinedChecks(job, token, sha) : "success";
+  return { ok: true, mergeable: pr.mergeable, draft: pr.draft, checks, headRef: pr.head?.ref, sha };
+}
+
+async function mergePr(job, token, prNumber, sha) {
+  const res = await ghApi(job, token, `pulls/${prNumber}/merge`, {
+    method: "PUT",
+    body: JSON.stringify({ merge_method: "squash", sha }),
+  });
+  if (res.ok) return { merged: true };
+  return { merged: false, reason: `merge_http_${res.status}`, text: (await res.text()).slice(0, 300) };
+}
+
+// Merge ONLY when our local tests passed AND GitHub reports the PR mergeable with
+// non-failing, non-pending checks. Returns {merged, reason}.
+async function tryMerge(job, token, prNumber, gate) {
+  if (gate.ran === true && gate.passed === false) return { merged: false, reason: "tests_failing" };
+  const st = await prMergeStatus(job, token, prNumber);
+  if (!st.ok) return { merged: false, reason: st.reason };
+  if (st.draft) return { merged: false, reason: "draft" };
+  // Require an affirmative mergeable=true (null = GitHub hasn't computed it yet).
+  if (st.mergeable !== true) return { merged: false, reason: "not_mergeable" };
+  if (st.checks === "failure") return { merged: false, reason: "checks_failing" };
+  if (st.checks === "pending") return { merged: false, reason: "checks_pending" };
+  step(job.runId, "merge:attempt", { prNumber });
+  const m = await mergePr(job, token, prNumber, st.sha);
+  step(job.runId, "merge:done", { merged: m.merged, reason: m.reason ?? null });
+  return m;
+}
+
+// Fetch the latest base branch and merge it into the working branch; if that
+// conflicts, have the agent resolve. Returns { ok, conflicts }.
+async function syncWithBase(job, repoDir, baseBranch, remoteUrl) {
+  await exec("git", ["fetch", remoteUrl, baseBranch], { cwd: repoDir, timeoutMs: GIT_TIMEOUT_MS });
+  const merge = await exec("git", ["merge", "--no-edit", "FETCH_HEAD"], { cwd: repoDir });
+  if (merge.code === 0) return { ok: true, conflicts: false };
+  step(job.runId, "conflicts:resolve", {});
+  const prompt =
+    `Merging the base branch '${baseBranch}' produced git conflicts. Resolve ALL conflict ` +
+    `markers correctly, preserving both the base changes and this branch's intent, then ` +
+    `make sure the project still builds. Output:\n${tail(merge.stdout + "\n" + merge.stderr, 6000)}`;
+  await runAgent(job, repoDir, prompt);
+  await exec("git", ["add", "-A"], { cwd: repoDir });
+  // Check the INDEX for leftover conflict markers (working tree may be staged).
+  const unresolved = await exec("git", ["diff", "--cached", "--check"], { cwd: repoDir });
+  const commit = await exec("git", ["commit", "--no-edit"], { cwd: repoDir });
+  if (unresolved.code !== 0 || commit.code !== 0) {
+    // Couldn't cleanly conclude the merge — abort so the branch stays pushable
+    // rather than getting stuck in a half-merged state that blocks `git push`.
+    step(job.runId, "conflicts:abort", { unresolved: unresolved.code, commit: commit.code });
+    await exec("git", ["merge", "--abort"], { cwd: repoDir }).catch(() => {});
+    return { ok: false, conflicts: true };
+  }
+  return { ok: true, conflicts: true };
+}
+
+// Collect human (non-bot) PR comments — both issue-level and inline review comments.
+async function fetchPrComments(job, token, prNumber) {
+  const issue = await ghApi(job, token, `issues/${prNumber}/comments?per_page=50`)
+    .then((r) => (r.ok ? r.json() : []))
+    .catch(() => []);
+  const review = await ghApi(job, token, `pulls/${prNumber}/comments?per_page=50`)
+    .then((r) => (r.ok ? r.json() : []))
+    .catch(() => []);
+  const lines = [
+    ...review.map((c) => `[${c.path}:${c.line ?? "?"}] ${c.user?.login}: ${c.body}`),
+    ...issue.map((c) => `${c.user?.login}: ${c.body}`),
+  ].filter((t) => !/fly-dev\[bot\]/i.test(t) && t.trim().length > 0);
+  return lines.join("\n\n").slice(0, 8000);
+}
+
+// "address_pr" mode: check out an existing PR branch, address its review comments,
+// resolve conflicts, make tests pass, push, and merge when green.
+async function handleAddressPr(job) {
+  if (!job.runId || !job.repo?.owner || !job.repo?.repo || !job.prNumber) {
+    return { ok: false, error: "missing_required_fields" };
+  }
+  const tokens = (
+    Array.isArray(job.githubTokens) && job.githubTokens.length ? job.githubTokens : [job.githubToken]
+  ).filter(Boolean);
+  const repoPath = `github.com/${job.repo.owner}/${job.repo.repo}.git`;
+  const cloneUrlFor = (t) => `https://x-access-token:${t}@${repoPath}`;
+  const workdir = await mkdtemp(path.join(tmpdir(), `fly-pr-${job.prNumber}-`));
+  const repoDir = path.join(workdir, job.repo.repo);
+  try {
+    step(job.runId, "clone:start", { mode: "address_pr", prNumber: job.prNumber });
+    let activeToken = null;
+    for (const t of tokens) {
+      const c = await exec("git", ["clone", cloneUrlFor(t), repoDir], { timeoutMs: GIT_TIMEOUT_MS });
+      if (c.code === 0) { activeToken = t; break; }
+      await rm(repoDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (!activeToken) return { ok: false, error: "clone_failed" };
+    const pushUrl = cloneUrlFor(activeToken);
+
+    const st = await prMergeStatus(job, activeToken, job.prNumber);
+    if (!st.ok || !st.headRef) return { ok: false, error: "pr_not_found", logs: st.reason ?? "" };
+    const headRef = st.headRef;
+    const baseBranch = job.repo.baseBranch || "main";
+
+    await exec("git", ["fetch", pushUrl, `refs/pull/${job.prNumber}/head`], { cwd: repoDir, timeoutMs: GIT_TIMEOUT_MS });
+    const co = await exec("git", ["checkout", "-B", headRef, "FETCH_HEAD"], { cwd: repoDir });
+    if (co.code !== 0) return { ok: false, error: "pr_checkout_failed", logs: co.stderr.slice(-2000) };
+    await exec("git", ["config", "user.email", "fly-dev[bot]@users.noreply.github.com"], { cwd: repoDir });
+    await exec("git", ["config", "user.name", "fly-dev[bot]"], { cwd: repoDir });
+    writeGitExclude(repoDir);
+
+    const comments = (job.comments && String(job.comments)) || (await fetchPrComments(job, activeToken, job.prNumber));
+    step(job.runId, "agent:start", { mode: "address_pr" });
+    const startedAt = Date.now();
+    await runAgent(
+      job,
+      repoDir,
+      `Address the following pull-request review feedback by editing this branch, then stop. ` +
+        `Keep changes focused on the feedback.\n\n${comments || "(no specific comments found — make the PR mergeable and green)"}`,
+    );
+    step(job.runId, "agent:done", { ms: Date.now() - startedAt });
+    await commitAll(repoDir, `fix: address review comments [fly-dev run ${job.runId}]`);
+
+    step(job.runId, "test:start");
+    const gate = await ensureTestsPass(job, repoDir);
+    step(job.runId, "sync:start", { baseBranch });
+    await syncWithBase(job, repoDir, baseBranch, pushUrl);
+
+    step(job.runId, "push:start", { headRef });
+    const push = await exec("git", ["push", pushUrl, `HEAD:${headRef}`], { cwd: repoDir, timeoutMs: GIT_TIMEOUT_MS });
+    if (push.code !== 0) return { ok: false, error: "push_failed", logs: push.stderr.slice(-2000) };
+    step(job.runId, "push:done");
+
+    const merge = await tryMerge(job, activeToken, job.prNumber, gate);
+    return {
+      ok: true,
+      prNumber: job.prNumber,
+      prUrl: `https://github.com/${job.repo.owner}/${job.repo.repo}/pull/${job.prNumber}`,
+      merged: merge.merged === true,
+      mergeReason: merge.reason ?? null,
+      testsRun: gate.ran,
+      testsPassed: gate.passed ?? null,
+      projectType: gate.projectType,
+      testSummary: tail(gate.summary, 2000),
+    };
+  } finally {
+    await rm(workdir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function handleRun(rawBody) {
   let job;
   try {
@@ -282,15 +524,11 @@ async function handleRun(rawBody) {
     await exec("git", ["checkout", "-b", branch], { cwd: repoDir });
     await exec("git", ["config", "user.email", "fly-dev[bot]@users.noreply.github.com"], { cwd: repoDir });
     await exec("git", ["config", "user.name", "fly-dev[bot]"], { cwd: repoDir });
+    writeGitExclude(repoDir);
 
-    const { cmd, args } = agentCommand(job);
-    step(job.runId, "agent:start", { provider: job.agentProvider ?? "claude-code", cmd });
+    step(job.runId, "agent:start", { provider: job.agentProvider ?? "claude-code" });
     const agentStartedAt = Date.now();
-    const agent = await exec(cmd, args, {
-      cwd: repoDir,
-      env: buildAgentEnv(job),
-      timeoutMs: AGENT_TIMEOUT_MS,
-    });
+    const agent = await runAgent(job, repoDir, job.objective);
     step(job.runId, "agent:done", { exitCode: agent.code, ms: Date.now() - agentStartedAt });
     const summary = (agent.stdout || "").slice(-4000);
     const logs = (agent.stderr || "").slice(-4000);
@@ -325,13 +563,16 @@ async function handleRun(rawBody) {
       return { ok: false, error: "commit_failed", logs: commit.stderr.slice(-2000), summary };
     }
 
-    // Test gate: install deps + run the suite. A failing suite does not block the
-    // PR — it opens it as a draft so a human reviews. See SANDBOX_REVIEW.md test gate.
+    // Test gate WITH a fix loop: re-run the agent on failures until the suite
+    // passes or we hit the attempt cap. Only a still-failing suite opens a draft.
     step(job.runId, "test:start");
-    const gate = await runTestGate(repoDir);
+    const gate = await ensureTestsPass(job, repoDir);
     const draft = gate.ran === true && gate.passed === false;
-    step(job.runId, "test:done", { ran: gate.ran, passed: gate.passed ?? null, projectType: gate.projectType });
 
+    // NOTE: the branch was just created from the freshly-cloned base, so it can't
+    // conflict at open time. Conflict resolution (which needs full history) happens
+    // in the address_pr flow when the base has since moved. tryMerge below refuses
+    // to merge a PR GitHub reports as conflicted.
     step(job.runId, "push:start", { branch });
     const push = await exec("git", ["push", pushUrl, branch], { cwd: repoDir, timeoutMs: GIT_TIMEOUT_MS });
     if (push.code !== 0) {
@@ -372,11 +613,17 @@ async function handleRun(rawBody) {
       };
     }
 
+    // Merge only on passing: local tests green + GitHub mergeable + checks not
+    // failing/pending. If CI is still pending, the worker's merge reaper finishes it.
+    const merge = await tryMerge(job, activeToken, pr.prNumber, gate);
+
     return {
       ok: true,
       prUrl: pr.prUrl,
       prNumber: pr.prNumber,
       prDraft: draft,
+      merged: merge.merged === true,
+      mergeReason: merge.reason ?? null,
       branch,
       commitSha,
       diff,
@@ -400,7 +647,12 @@ const server = http.createServer(async (request, response) => {
   if (request.method === "POST" && request.url === "/run") {
     try {
       const body = await readBody(request);
-      const result = await handleRun(body);
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch { /* handleRun reports invalid_json */ }
+      const result =
+        parsed && parsed.mode === "address_pr"
+          ? await handleAddressPr(parsed)
+          : await handleRun(body);
       return sendJson(response, 200, result);
     } catch (err) {
       return sendJson(response, 200, { ok: false, error: "exception", message: String(err) });

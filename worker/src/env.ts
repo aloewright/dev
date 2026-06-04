@@ -32,6 +32,8 @@ export type ContainerRunResult = {
   prUrl?: string | null;
   prNumber?: number | null;
   prDraft?: boolean | null;
+  merged?: boolean | null;
+  mergeReason?: string | null;
   branch?: string | null;
   commitSha?: string | null;
   diff?: string | null;

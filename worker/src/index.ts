@@ -1003,12 +1003,14 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
         payload.runId,
         "agent.result",
         result.ok
-          ? `Agent completed. PR: ${result.prUrl ?? "(none)"}${result.prDraft ? " (draft)" : ""}${testNote}`
+          ? `Agent completed. PR: ${result.prUrl ?? "(none)"}${result.prDraft ? " (draft)" : ""}${result.merged ? " — MERGED ✅" : result.mergeReason ? ` (not merged: ${result.mergeReason})` : ""}${testNote}`
           : `Agent finished without a PR: ${result.error ?? "unknown"}${testNote}`,
         result.ok ? "info" : "warn",
         {
           prUrl: result.prUrl ?? null,
           prDraft: result.prDraft ?? null,
+          merged: result.merged ?? null,
+          mergeReason: result.mergeReason ?? null,
           branch: result.branch ?? null,
           prNumber: result.prNumber ?? null,
           testsRun: result.testsRun ?? null,
