@@ -13,8 +13,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 const PORT = Number(process.env.PORT ?? 8080);
-// 250 turns can run long; an 8-minute cap would SIGKILL the agent mid-task.
-const AGENT_TIMEOUT_MS = 45 * 60 * 1000;
+// 250 turns can run long; keep the cap generous so the agent is never SIGKILLed
+// mid-task. Floor is 90 minutes.
+const AGENT_TIMEOUT_MS = 90 * 60 * 1000;
 const GIT_TIMEOUT_MS = 2 * 60 * 1000;
 const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
 const TEST_TIMEOUT_MS = 5 * 60 * 1000;
