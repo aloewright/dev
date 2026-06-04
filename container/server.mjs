@@ -13,7 +13,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 const PORT = Number(process.env.PORT ?? 8080);
-const AGENT_TIMEOUT_MS = 8 * 60 * 1000;
+// 250 turns can run long; keep the cap generous so the agent is never SIGKILLed
+// mid-task. Floor is 90 minutes.
+const AGENT_TIMEOUT_MS = 90 * 60 * 1000;
 const GIT_TIMEOUT_MS = 2 * 60 * 1000;
 const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
 const TEST_TIMEOUT_MS = 5 * 60 * 1000;
@@ -31,6 +33,12 @@ async function readBody(request) {
 
 function tail(text, n = 3000) {
   return (text || "").slice(-n);
+}
+
+// One structured line per stage so `wrangler tail` / container logs show exactly
+// where a run is and how long each stage took.
+function step(runId, stage, extra = {}) {
+  console.log(JSON.stringify({ t: new Date().toISOString(), runId, stage, ...extra }));
 }
 
 function exec(cmd, args, opts = {}) {
@@ -88,7 +96,7 @@ function agentCommand(job) {
   }
   return {
     cmd: "claude",
-    args: ["--print", "--permission-mode", "bypassPermissions", "--max-turns", "30", job.objective],
+    args: ["--print", "--permission-mode", "bypassPermissions", "--max-turns", "250", job.objective],
   };
 }
 
@@ -231,32 +239,40 @@ async function handleRun(rawBody) {
   const cloneUrl = `https://x-access-token:${job.githubToken}@github.com/${job.repo.owner}/${job.repo.repo}.git`;
 
   try {
+    step(job.runId, "clone:start", { repo: `${job.repo.owner}/${job.repo.repo}`, baseBranch });
     const clone = await exec(
       "git",
       ["clone", "--depth=1", "--branch", baseBranch, cloneUrl, repoDir],
       { timeoutMs: GIT_TIMEOUT_MS },
     );
     if (clone.code !== 0) {
+      step(job.runId, "clone:failed", { code: clone.code });
       return { ok: false, error: "clone_failed", logs: clone.stderr.slice(-4000) };
     }
+    step(job.runId, "clone:done");
 
     await exec("git", ["checkout", "-b", branch], { cwd: repoDir });
     await exec("git", ["config", "user.email", "fly-dev[bot]@users.noreply.github.com"], { cwd: repoDir });
     await exec("git", ["config", "user.name", "fly-dev[bot]"], { cwd: repoDir });
 
     const { cmd, args } = agentCommand(job);
+    step(job.runId, "agent:start", { provider: job.agentProvider ?? "claude-code", cmd });
+    const agentStartedAt = Date.now();
     const agent = await exec(cmd, args, {
       cwd: repoDir,
       env: buildAgentEnv(job),
       timeoutMs: AGENT_TIMEOUT_MS,
     });
+    step(job.runId, "agent:done", { exitCode: agent.code, ms: Date.now() - agentStartedAt });
     const summary = (agent.stdout || "").slice(-4000);
     const logs = (agent.stderr || "").slice(-4000);
 
     const status = await exec("git", ["status", "--porcelain"], { cwd: repoDir });
     if (!status.stdout.trim()) {
+      step(job.runId, "no_changes");
       return { ok: false, error: "no_changes", summary, logs };
     }
+    step(job.runId, "changes:detected");
 
     // Commit the agent's changes BEFORE install/test so install artifacts
     // (e.g. node_modules) are never added to the commit.
@@ -273,13 +289,18 @@ async function handleRun(rawBody) {
 
     // Test gate: install deps + run the suite. A failing suite does not block the
     // PR — it opens it as a draft so a human reviews. See SANDBOX_REVIEW.md test gate.
+    step(job.runId, "test:start");
     const gate = await runTestGate(repoDir);
     const draft = gate.ran === true && gate.passed === false;
+    step(job.runId, "test:done", { ran: gate.ran, passed: gate.passed ?? null, projectType: gate.projectType });
 
+    step(job.runId, "push:start", { branch });
     const push = await exec("git", ["push", "origin", branch], { cwd: repoDir, timeoutMs: GIT_TIMEOUT_MS });
     if (push.code !== 0) {
+      step(job.runId, "push:failed", { code: push.code });
       return { ok: false, error: "push_failed", logs: push.stderr.slice(-2000), summary };
     }
+    step(job.runId, "push:done");
 
     const head = await exec("git", ["rev-parse", "HEAD"], { cwd: repoDir });
     const commitSha = head.stdout.trim();
@@ -293,7 +314,9 @@ async function handleRun(rawBody) {
       (gate.ran ? `\`\`\`\n${tail(gate.summary, 1500)}\n\`\`\`\n\n` : "") +
       `---\n_Opened automatically by fly-dev run ${job.runId}._`;
 
+    step(job.runId, "pr:start", { draft });
     const pr = await openPullRequest(job, branch, baseBranch, title, prBody, draft);
+    step(job.runId, "pr:done", { ok: pr.ok, prNumber: pr.prNumber ?? null, status: pr.status ?? null });
     if (!pr.ok) {
       return {
         ok: false,
