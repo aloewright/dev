@@ -19,6 +19,8 @@ import {
   recordRunEvent,
   recordUsage,
   reclaimUserData,
+  getActiveRunCount,
+  runSql,
 } from "./platform/data";
 import {
   autoMapProjects,
@@ -39,6 +41,8 @@ import {
 import {
   approveRun,
   cancelRun,
+  retryTaskRun,
+  nextDispatchSeq,
   createTaskRun,
   enqueueRun,
   createTemplateApp,
@@ -51,7 +55,7 @@ import {
   type CreateTaskPayload,
 } from "./platform/orchestration";
 import { writeBackToLinear } from "./platform/linear";
-import { mergeWhenGreen } from "./platform/github";
+import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/github";
 import { continueProject } from "./platform/continue";
 import {
   isRetryableError,
@@ -569,6 +573,62 @@ app.post("/api/runs/:id/cancel", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
   return cancelRun(c.env, user, c.req.param("id"));
+});
+
+app.post("/api/runs/:id/retry", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return retryTaskRun(c.env, user, c.req.param("id"));
+});
+
+app.delete("/api/repos/:id", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const repoId = c.req.param("id");
+  const repo = await first<{ owner: string; name: string }>(
+    c.env,
+    "SELECT owner, name FROM github_repos WHERE id = ? AND user_id = ?",
+    [repoId, user.id],
+  );
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+
+  const token = await getDecryptedToken(c.env, user.id, "github");
+  if (!token) return c.json({ error: "GitHub connection required" }, 400);
+
+  const result = await deleteRepository(token, repo.owner, repo.name);
+  if (!result.ok) return c.json({ error: result.error }, 500);
+
+  await runSql(c.env, "DELETE FROM github_repos WHERE id = ? AND user_id = ?", [repoId, user.id]);
+  return c.json({ ok: true });
+});
+
+app.patch("/api/repos/:id", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const repoId = c.req.param("id");
+  const { name: newName } = (await c.req.json()) as { name: string };
+  if (!newName) return c.json({ error: "New name is required" }, 400);
+
+  const repo = await first<{ owner: string; name: string }>(
+    c.env,
+    "SELECT owner, name FROM github_repos WHERE id = ? AND user_id = ?",
+    [repoId, user.id],
+  );
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+
+  const token = await getDecryptedToken(c.env, user.id, "github");
+  if (!token) return c.json({ error: "GitHub connection required" }, 400);
+
+  const result = await renameRepository(token, repo.owner, repo.name, newName);
+  if (!result.ok) return c.json({ error: result.error }, 500);
+
+  await runSql(c.env, "UPDATE github_repos SET name = ?, full_name = ? WHERE id = ? AND user_id = ?", [
+    result.name!,
+    `${repo.owner}/${result.name!}`,
+    repoId,
+    user.id,
+  ]);
+  return c.json({ ok: true, name: result.name });
 });
 
 // Browsers navigating to /connect or /callback expect to land somewhere
@@ -1096,9 +1156,19 @@ export default {
   },
 
   async queue(batch: MessageBatch<WorkQueueMessage>, env: Env): Promise<void> {
+    const maxInstances = Number.parseInt(env.MAX_CONTAINER_INSTANCES ?? "8", 10);
+
     for (const message of batch.messages) {
       try {
         if (message.body.action === "start-run") {
+          // Check for open instances before releasing the execution.
+          const runningCount = await getActiveRunCount(env);
+          if (runningCount >= maxInstances) {
+            // No open instances: retry later.
+            message.retry();
+            continue;
+          }
+
           const run = await first<{ objective: string }>(
             env,
             "SELECT objective FROM runs WHERE id = ?",
@@ -1134,21 +1204,7 @@ export default {
   },
 };
 
-// Monotonic per-run dispatch sequence → a UNIQUE Workflow instance id each re-dispatch
-// (`${runId}-r${seq}`). Workflow.create is idempotent on id, so reusing a suffix — or
-// re-enqueuing with no attempt (bare `${runId}`) after the run already ran once — would
-// silently no-op and the run would never restart. Seed strictly above any prior counter
-// (including the old single-`retryCount` scheme) so a sequence value is never reused.
-function nextDispatchSeq(meta: Record<string, unknown>): number {
-  const prior = Math.max(
-    typeof meta.dispatchSeq === "number" ? (meta.dispatchSeq as number) : 0,
-    typeof meta.retryCount === "number" ? (meta.retryCount as number) : 0,
-    typeof meta.stuckRedispatch === "number" ? (meta.stuckRedispatch as number) : 0,
-  );
-  const seq = prior + 1;
-  meta.dispatchSeq = seq;
-  return seq;
-}
+
 
 async function reapStuckRuns(env: Env): Promise<void> {
   // 1) Recently-failed runs with a retryable error, under the attempt cap.

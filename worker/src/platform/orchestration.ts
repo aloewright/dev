@@ -165,6 +165,72 @@ export async function cancelRun(env: Env, user: CurrentUser, runId: string) {
   return Response.json({ id: runId, status: "cancelled" });
 }
 
+// Monotonic per-run dispatch sequence → a UNIQUE Workflow instance id each re-dispatch
+// (`${runId}-r${seq}`). Workflow.create is idempotent on id, so reusing a suffix — or
+// re-enqueuing with no attempt (bare `${runId}`) after the run already ran once — would
+// silently no-op and the run would never restart. Seed strictly above any prior counter
+// (including the old single-`retryCount` scheme) so a sequence value is never reused.
+export function nextDispatchSeq(meta: Record<string, unknown>): number {
+  const prior = Math.max(
+    typeof meta.dispatchSeq === "number" ? (meta.dispatchSeq as number) : 0,
+    typeof meta.retryCount === "number" ? (meta.retryCount as number) : 0,
+    typeof meta.stuckRedispatch === "number" ? (meta.stuckRedispatch as number) : 0,
+  );
+  const seq = prior + 1;
+  meta.dispatchSeq = seq;
+  return seq;
+}
+
+export async function retryTaskRun(env: Env, user: CurrentUser, runId: string) {
+  // Manual catalyst: no retry limit check.
+  const run = await first<{ status: string; user_id: string; project_id: string | null; metadata_json: string }>(
+    env,
+    "SELECT status, user_id, project_id, metadata_json FROM runs WHERE id = ? AND user_id = ?",
+    [runId, user.id],
+  );
+
+  if (!run) {
+    return Response.json({ error: "Run not found" }, { status: 404 });
+  }
+
+  let meta: Record<string, unknown> = {};
+  try {
+    meta = JSON.parse(run.metadata_json) as Record<string, unknown>;
+  } catch {
+    meta = {};
+  }
+
+  // Increment manual retry counter for tracking.
+  meta.manualRetries = (typeof meta.manualRetries === "number" ? meta.manualRetries : 0) + 1;
+  const seq = nextDispatchSeq(meta);
+
+  await env.DB.prepare(
+    `UPDATE runs SET status = 'queued', last_error = NULL, started_at = NULL, finished_at = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND user_id = ?`,
+  )
+    .bind(JSON.stringify(meta), runId, user.id)
+    .run();
+
+  await recordRunEvent(
+    env,
+    runId,
+    "run.retry",
+    `Manual retry requested (catalyst: user). Re-dispatch sequence #${seq}.`,
+    "info",
+    { attempt: seq },
+  );
+
+  await enqueueRun(env, {
+    runId,
+    userId: run.user_id,
+    projectId: run.project_id ?? undefined,
+    action: "start-run",
+    attempt: seq,
+  });
+
+  return Response.json({ id: runId, status: "queued" });
+}
+
 export async function createTemplateApp(
   env: Env,
   user: CurrentUser,

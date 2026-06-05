@@ -37,7 +37,7 @@ describe("shouldRetryNoChanges", () => {
 
 describe("MAX_RUN_RETRIES", () => {
   it("caps general auto-retries", () => {
-    expect(MAX_RUN_RETRIES).toBe(3);
+    expect(MAX_RUN_RETRIES).toBe(5);
   });
 });
 
