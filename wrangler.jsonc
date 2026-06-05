@@ -201,7 +201,7 @@
     // Agent memory (self-hosted Hindsight). Flip MEMORY_ENABLED to "true" to turn on
     // recall/retain/reflect; secrets (HINDSIGHT_API_KEY, HINDSIGHT_CF_ACCESS_CLIENT_ID/
     // SECRET) are set via `wrangler secret put`. Server lives in infra/hindsight/.
-    "MEMORY_ENABLED": "false",
+    "MEMORY_ENABLED": "true",
     "MEMORY_REFLECT_MODE": "auto",
     "HINDSIGHT_BASE_URL": "https://hindsight.fly.pm"
   }
