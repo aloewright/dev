@@ -18,6 +18,13 @@ export const RETRYABLE_ERRORS = [
   "Container /run returned",
   "exception",
   "Agent produced no changes",
+  // Container-capacity failures are normally bounded-requeued at container-start (see
+  // isCapacityError + the workflow's "start sandbox container" step). These two are a
+  // SAFETY NET: if a capacity failure ever lands in status='failed' via a path the
+  // bounded requeue missed, the reaper still picks it up via the budget rather than
+  // stranding the run.
+  "Maximum number of running container instances",
+  "The container is not running",
 ];
 
 export const MAX_RUN_RETRIES = 5;
@@ -25,6 +32,20 @@ export const MAX_RUN_RETRIES = 5;
 export function isRetryableError(lastError: string | null): boolean {
   if (!lastError) return false;
   return RETRYABLE_ERRORS.some((needle) => lastError.includes(needle));
+}
+
+// Transient container-capacity errors: the platform has no free instance (max_instances).
+// These must REQUEUE (stuck budget), never burn the error budget or strand the run.
+const CAPACITY_ERRORS = [
+  "Maximum number of running container instances",
+  "The container is not running",
+  "there is no container instance",
+  "no container instance",
+];
+
+export function isCapacityError(lastError: string | null): boolean {
+  if (!lastError) return false;
+  return CAPACITY_ERRORS.some((needle) => lastError.includes(needle));
 }
 
 // `no_changes` is normally terminal — a clean signal that the issue had no work. But a
