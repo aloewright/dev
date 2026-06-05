@@ -20,7 +20,11 @@ import {
   TextInput,
   Textarea,
   Title,
+  ActionIcon,
+  Menu,
+  Modal,
 } from "@mantine/core";
+import { IconDots, IconEdit, IconTrash, IconRefresh } from "@tabler/icons-react";
 import { fetchJson } from "@/lib/api";
 
 type Provider = "github" | "linear";
@@ -910,39 +914,139 @@ function ProjectRow({
 }
 
 function RepoRow({ repo }: { repo: Overview["repos"][number] }) {
+  const queryClient = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const [newName, setNewName] = useState(repo.name);
+
+  const deleteRepo = useMutation({
+    mutationFn: () =>
+      fetchJson(`/api/repos/${repo.id}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+      }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["overview"] }),
+  });
+
+  const renameRepo = useMutation({
+    mutationFn: (name: string) =>
+      fetchJson(`/api/repos/${repo.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name }),
+      }),
+    onSuccess: () => {
+      setEditing(false);
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+    },
+  });
+
   return (
-    <Group justify="space-between" px="lg" py="sm" style={rowBorder} wrap="wrap">
-      <Box style={{ minWidth: 0, flex: 1 }}>
-        <Anchor href={repo.url} target="_blank" size="sm" fw={600} truncate style={{ display: "block" }}>
-          {repo.fullName}
-        </Anchor>
-        {repo.description ? (
-          <Text size="xs" c="dimmed" truncate>
-            {repo.description}
+    <>
+      <Group justify="space-between" px="lg" py="sm" style={rowBorder} wrap="wrap">
+        <Box style={{ minWidth: 0, flex: 1 }}>
+          <Anchor
+            href={repo.url}
+            target="_blank"
+            size="sm"
+            fw={600}
+            truncate
+            style={{ display: "block" }}
+          >
+            {repo.fullName}
+          </Anchor>
+          {repo.description ? (
+            <Text size="xs" c="dimmed" truncate>
+              {repo.description}
+            </Text>
+          ) : null}
+        </Box>
+        <Group gap="xs">
+          <Group gap={4} wrap="nowrap">
+            {repo.language ? (
+              <Badge size="xs" variant="light" color="indigo" tt="none">
+                {repo.language}
+              </Badge>
+            ) : null}
+            {repo.private ? (
+              <Badge size="xs" variant="outline" color="gray" tt="none">
+                private
+              </Badge>
+            ) : null}
+            {repo.archived ? (
+              <Badge size="xs" variant="outline" color="orange" tt="none">
+                archived
+              </Badge>
+            ) : null}
+          </Group>
+          <Text size="sm" c="dimmed" visibleFrom="sm">
+            {repo.openIssues} open · ★ {repo.stars}
           </Text>
-        ) : null}
-      </Box>
-      <Group gap="xs">
-        {repo.language ? (
-          <Badge size="xs" variant="light" color="indigo" tt="none">
-            {repo.language}
-          </Badge>
-        ) : null}
-        {repo.private ? (
-          <Badge size="xs" variant="outline" color="gray" tt="none">
-            private
-          </Badge>
-        ) : null}
-        {repo.archived ? (
-          <Badge size="xs" variant="outline" color="orange" tt="none">
-            archived
-          </Badge>
-        ) : null}
+          <Menu shadow="md" width={200} position="bottom-end">
+            <Menu.Target>
+              <ActionIcon variant="subtle" color="gray" size="sm">
+                <IconDots style={{ width: 16, height: 16 }} />
+              </ActionIcon>
+            </Menu.Target>
+
+            <Menu.Dropdown>
+              <Menu.Label>Repository</Menu.Label>
+              <Menu.Item
+                leftSection={<IconEdit style={{ width: 14, height: 14 }} />}
+                onClick={() => {
+                  setNewName(repo.name);
+                  setEditing(true);
+                }}
+              >
+                Edit / Rename
+              </Menu.Item>
+              <Menu.Divider />
+              <Menu.Label c="red">Danger zone</Menu.Label>
+              <Menu.Item
+                color="red"
+                leftSection={
+                  deleteRepo.isPending ? (
+                    <Loader size={14} color="red" />
+                  ) : (
+                    <IconTrash style={{ width: 14, height: 14 }} />
+                  )
+                }
+                disabled={deleteRepo.isPending}
+                onClick={() => {
+                  if (confirm(`Are you sure you want to delete ${repo.fullName} from GitHub?`)) {
+                    deleteRepo.mutate();
+                  }
+                }}
+              >
+                Delete from GitHub
+              </Menu.Item>
+            </Menu.Dropdown>
+          </Menu>
+        </Group>
       </Group>
-      <Text size="sm" c="dimmed">
-        {repo.openIssues} open · ★ {repo.stars}
-      </Text>
-    </Group>
+
+      <Modal opened={editing} onClose={() => setEditing(false)} title="Rename repository" centered>
+        <Stack gap="md">
+          <TextInput
+            label="New repository name"
+            value={newName}
+            onChange={(e) => setNewName(e.currentTarget.value)}
+            placeholder="e.g. my-awesome-app"
+          />
+          <Group justify="flex-end">
+            <Button variant="subtle" color="gray" onClick={() => setEditing(false)}>
+              Cancel
+            </Button>
+            <Button
+              loading={renameRepo.isPending}
+              disabled={newName === repo.name || newName.length < 1}
+              onClick={() => renameRepo.mutate(newName)}
+            >
+              Save changes
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+    </>
   );
 }
 
@@ -964,7 +1068,18 @@ function RunRow({ run }: { run: Overview["recentRuns"][number] }) {
       }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["overview"] }),
   });
+  const retry = useMutation({
+    mutationFn: () =>
+      fetchJson(`/api/runs/${run.id}/retry`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["overview"] }),
+  });
+
   const waiting = run.status === "waiting_approval";
+  const active = run.status === "running" || run.status === "queued";
+
   return (
     <Group justify="space-between" px="lg" py="sm" style={rowBorder} wrap="wrap">
       <Box style={{ minWidth: 0, flex: 1 }}>
@@ -981,7 +1096,12 @@ function RunRow({ run }: { run: Overview["recentRuns"][number] }) {
       </Group>
       {waiting ? (
         <Group gap="xs">
-          <Button size="xs" color="teal" loading={approve.isPending} onClick={() => approve.mutate()}>
+          <Button
+            size="xs"
+            color="teal"
+            loading={approve.isPending}
+            onClick={() => approve.mutate()}
+          >
             Approve
           </Button>
           <Button
@@ -995,9 +1115,23 @@ function RunRow({ run }: { run: Overview["recentRuns"][number] }) {
           </Button>
         </Group>
       ) : (
-        <Text size="sm" c="dimmed">
-          {run.approvalRequired ? "approval" : "queued"}
-        </Text>
+        <Group gap="xs">
+          {!active && (
+            <Button
+              size="xs"
+              variant="light"
+              color="indigo"
+              leftSection={<IconRefresh style={{ width: 14, height: 14 }} />}
+              loading={retry.isPending}
+              onClick={() => retry.mutate()}
+            >
+              Retry
+            </Button>
+          )}
+          <Text size="sm" c="dimmed">
+            {run.approvalRequired ? "approval" : active ? run.status : "done"}
+          </Text>
+        </Group>
       )}
     </Group>
   );

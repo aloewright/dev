@@ -20,7 +20,7 @@ export const RETRYABLE_ERRORS = [
   "Agent produced no changes",
 ];
 
-export const MAX_RUN_RETRIES = 3;
+export const MAX_RUN_RETRIES = 5;
 
 export function isRetryableError(lastError: string | null): boolean {
   if (!lastError) return false;

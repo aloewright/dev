@@ -168,3 +168,44 @@ function base64urlBytes(bytes: Uint8Array): string {
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
+
+export async function deleteRepository(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const headers = ghHeaders(token);
+  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+    method: "DELETE",
+    headers,
+  });
+
+  if (response.ok || response.status === 204) {
+    return { ok: true };
+  }
+
+  const body = (await response.json().catch(() => ({}))) as { message?: string };
+  return { ok: false, error: body.message ?? `HTTP ${response.status}` };
+}
+
+export async function renameRepository(
+  token: string,
+  owner: string,
+  repo: string,
+  newName: string,
+): Promise<{ ok: boolean; name?: string; error?: string }> {
+  const headers = { ...ghHeaders(token), "content-type": "application/json" };
+  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ name: newName }),
+  });
+
+  if (response.ok) {
+    const data = (await response.json()) as { name: string };
+    return { ok: true, name: data.name };
+  }
+
+  const body = (await response.json().catch(() => ({}))) as { message?: string };
+  return { ok: false, error: body.message ?? `HTTP ${response.status}` };
+}
