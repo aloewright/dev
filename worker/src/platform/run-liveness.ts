@@ -17,7 +17,10 @@ export function isStalledRun(run: RunLiveness, nowMs: number): boolean {
     return false;
   }
   if (!run.lastHeartbeatAt) return true;
-  const hb = Date.parse(run.lastHeartbeatAt);
+  const raw = run.lastHeartbeatAt;
+  // SQLite CURRENT_TIMESTAMP is "YYYY-MM-DD HH:MM:SS" in UTC with no timezone — normalize to ISO-UTC.
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw) ? raw.replace(" ", "T") + "Z" : raw;
+  const hb = Date.parse(iso);
   if (Number.isNaN(hb)) return true;
   return nowMs - hb > STALL_THRESHOLD_MS;
 }

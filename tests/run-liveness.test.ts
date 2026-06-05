@@ -21,4 +21,11 @@ describe("isStalledRun", () => {
     expect(isStalledRun({ status: "completed", lastHeartbeatAt: hb }, now)).toBe(false);
     expect(isStalledRun({ status: "queued", lastHeartbeatAt: null }, now)).toBe(false);
   });
+  it("parses SQLite CURRENT_TIMESTAMP format (space, no Z) as UTC", () => {
+    // 10 minutes before `now`, in SQLite's text format.
+    const sqlite = "2026-06-05 11:50:00";
+    expect(isStalledRun({ status: "running", lastHeartbeatAt: sqlite }, now)).toBe(true);
+    const fresh = "2026-06-05 11:59:30";
+    expect(isStalledRun({ status: "running", lastHeartbeatAt: fresh }, now)).toBe(false);
+  });
 });
