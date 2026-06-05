@@ -156,11 +156,12 @@
     {
       "class_name": "SandboxContainer",
       "image": "./container/Dockerfile",
-      // standard-3 (2 vCPU / 8 GiB / 16 GB disk). Upgraded from standard-2 — more
-      // CPU/disk for the clone + agent + test gate, and a different capacity pool
-      // than the constrained standard-2 (which was returning "no free slot").
-      // Wrangler allows ONE instance_type per container; this is a switch, not an add.
-      "instance_type": "standard-3",
+      // standard-3 specs (2 vCPU / 8 GiB / 16 GB disk), set EXPLICITLY as a custom
+      // instance type because the named "standard-3" string did not apply the larger
+      // resources on this wrangler/platform version (the deployed instance stayed at
+      // 1 vCPU / 6 GiB). More CPU/disk for clone + agent + test gate, and a different
+      // capacity pool than the constrained standard-2 ("no free slot").
+      "instance_type": { "vcpu": 2, "memory_mib": 8192, "disk_mb": 16000 },
       "max_instances": 8
     }
   ],
