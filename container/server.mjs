@@ -467,6 +467,52 @@ async function handleAddressPr(job) {
   }
 }
 
+// --- Clone failure classification + bounded transient retry ------------------
+// A `git clone` fails for two fundamentally different reasons the reaper must treat
+// differently. It previously lumped both into a single retryable "clone_failed", which
+// let a PERMANENT 403 get re-dispatched up to ~20x via the self-healing reaper — a
+// self-inflicted request storm that itself triggered GitHub rate-limiting / TLS resets.
+//   - clone_auth_failed      : 401/403, "not granted", "Permission … denied",
+//                              "Authentication failed", not-found. A retry CANNOT fix a
+//                              token that can't reach the repo → terminal (kept OUT of
+//                              reaper-policy RETRYABLE_ERRORS).
+//   - clone_transient_failed : GnuTLS/TLS reset, "Failed to connect", cert-verify,
+//                              429/5xx. Recovers on a second try → retried in-container
+//                              with backoff; if it still fails it surfaces terminal
+//                              rather than feeding the cron re-dispatch storm.
+// Order matters: the rate-limit / network checks run BEFORE the auth check so a 403 that
+// is really a secondary rate-limit isn't misread as a permanent permission failure.
+function classifyCloneError(stderr) {
+  const s = stderr || "";
+  if (/\b429\b|rate limit|secondary rate|abuse detection|retry-after/i.test(s)) return "clone_transient_failed";
+  if (/GnuTLS|TLS connection|\bSSL\b|recv error|send error|early EOF|RPC failed|connection reset|Could not resolve host|Failed to connect|Connection timed out|timed out|certificate verification failed|unexpected disconnect|HTTP 5\d\d/i.test(s)) return "clone_transient_failed";
+  if (/\b40[13]\b|Authentication failed|Invalid username or token|not granted|Permission to .* denied|Permission denied|could not read Username|terminal prompts disabled|[Rr]epository\b[^\n]{0,200}not found/i.test(s)) return "clone_auth_failed";
+  return "clone_failed";
+}
+
+const CLONE_MAX_ATTEMPTS = 3;
+
+// Clone the repo, trying each candidate token once per attempt (the least-privilege App
+// token can 403 on repos it can't reach; a later token may authenticate). On an
+// all-tokens-failed result that is TRANSIENT, back off with jitter and retry the whole
+// set — same-second concurrent-clone bursts produce intermittent TLS resets that clear
+// on a retry. Auth failures stop immediately (a 403 won't fix itself). Returns
+// { code, activeToken, stderr }; activeToken is null on failure.
+async function cloneWithRetry(runId, tokens, cloneUrlFor, repoDir, gitArgs) {
+  let clone = { code: -1, stderr: "no token" };
+  for (let attempt = 1; attempt <= CLONE_MAX_ATTEMPTS; attempt++) {
+    for (const tok of tokens) {
+      clone = await exec("git", ["clone", ...gitArgs, cloneUrlFor(tok), repoDir], { timeoutMs: GIT_TIMEOUT_MS });
+      if (clone.code === 0) return { code: 0, activeToken: tok, stderr: "" };
+      step(runId, "clone:retry", { code: clone.code, attempt, errorClass: classifyCloneError(clone.stderr) });
+      await rm(repoDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (classifyCloneError(clone.stderr) !== "clone_transient_failed" || attempt === CLONE_MAX_ATTEMPTS) break;
+    await sleep(1500 * attempt + Math.floor(Math.random() * 750));
+  }
+  return { code: clone.code, activeToken: null, stderr: clone.stderr };
+}
+
 async function handleAddressPrInner(job) {
   if (!job.runId || !job.repo?.owner || !job.repo?.repo || !job.prNumber) {
     return { ok: false, error: "missing_required_fields" };
@@ -480,13 +526,13 @@ async function handleAddressPrInner(job) {
   const repoDir = path.join(workdir, job.repo.repo);
   try {
     step(job.runId, "clone:start", { mode: "address_pr", prNumber: job.prNumber });
-    let activeToken = null;
-    for (const t of tokens) {
-      const c = await exec("git", ["clone", cloneUrlFor(t), repoDir], { timeoutMs: GIT_TIMEOUT_MS });
-      if (c.code === 0) { activeToken = t; break; }
-      await rm(repoDir, { recursive: true, force: true }).catch(() => {});
+    const clone = await cloneWithRetry(job.runId, tokens, cloneUrlFor, repoDir, []);
+    const activeToken = clone.activeToken;
+    if (!activeToken) {
+      const errorClass = classifyCloneError(clone.stderr);
+      step(job.runId, "clone:failed", { code: clone.code, errorClass, mode: "address_pr" });
+      return { ok: false, error: errorClass, logs: (clone.stderr || "").slice(-4000) };
     }
-    if (!activeToken) return { ok: false, error: "clone_failed" };
     const pushUrl = cloneUrlFor(activeToken);
 
     const st = await prMergeStatus(job, activeToken, job.prNumber);
@@ -584,22 +630,13 @@ async function handleRunInner(rawBody) {
 
   try {
     step(job.runId, "clone:start", { repo: `${job.repo.owner}/${job.repo.repo}`, baseBranch, tokenCandidates: tokens.length });
-    let clone = { code: -1, stderr: "no token" };
-    let activeToken = null;
-    for (const tok of tokens) {
-      // No --branch: clone the repo's DEFAULT branch (main, master, develop, …).
-      clone = await exec(
-        "git",
-        ["clone", "--depth=1", cloneUrlFor(tok), repoDir],
-        { timeoutMs: GIT_TIMEOUT_MS },
-      );
-      if (clone.code === 0) { activeToken = tok; break; }
-      step(job.runId, "clone:retry", { code: clone.code, authError: /403|401|not granted|Authentication/i.test(clone.stderr) });
-      await rm(repoDir, { recursive: true, force: true }).catch(() => {});
-    }
+    // No --branch: clone the repo's DEFAULT branch (main, master, develop, …).
+    const clone = await cloneWithRetry(job.runId, tokens, cloneUrlFor, repoDir, ["--depth=1"]);
+    const activeToken = clone.activeToken;
     if (clone.code !== 0 || !activeToken) {
-      step(job.runId, "clone:failed", { code: clone.code });
-      return { ok: false, error: "clone_failed", logs: clone.stderr.slice(-4000) };
+      const errorClass = classifyCloneError(clone.stderr);
+      step(job.runId, "clone:failed", { code: clone.code, errorClass });
+      return { ok: false, error: errorClass, logs: (clone.stderr || "").slice(-4000) };
     }
     // Record the actual default branch we landed on (used as PR base + diff base).
     const headRef = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir });

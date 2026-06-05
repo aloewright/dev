@@ -9,6 +9,17 @@
 // retry can't fix). `no_changes` recovery is handled separately and one-time-only —
 // see shouldRetryNoChanges.
 export const RETRYABLE_ERRORS = [
+  // Generic clone failure of UNKNOWN cause stays retryable. The container now classifies
+  // clone failures (container/server.mjs classifyCloneError) into two DISTINCT terminal
+  // codes that are deliberately absent from this list:
+  //   - clone_auth_failed      (401/403/permission/not-found — a retry can't fix a token
+  //                             that can't reach the repo)
+  //   - clone_transient_failed (TLS reset / 429 / 5xx — already retried in-container with
+  //                             backoff; surfacing it terminal avoids a self-inflicted
+  //                             cron re-dispatch storm, which itself triggered the rate
+  //                             limiting / TLS resets in the first place)
+  // The substring matcher in isRetryableError is safe: neither code contains the
+  // substring "clone_failed" (…_auth_failed / …_transient_failed break it up).
   "clone_failed",
   "push_failed",
   "pr_failed",
