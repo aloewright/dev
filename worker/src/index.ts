@@ -573,6 +573,7 @@ app.get("/api/runs/:id/events/stream", async (c) => {
   const TERMINAL = new Set(["completed", "failed", "cancelled"]);
   const MAX_LIFETIME_MS = 15 * 60 * 1000;
 
+  let cancelled = false;
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: unknown) =>
@@ -581,29 +582,36 @@ app.get("/api/runs/:id/events/stream", async (c) => {
       let lastStatus = "";
       const startedAt = Date.now();
       send("open", { runId });
-      while (Date.now() - startedAt < MAX_LIFETIME_MS) {
-        const rows = await all<{ id: number; eventType: string; message: string; severity: string; metadataJson: string; createdAt: string }>(
-          env,
-          `SELECT id, event_type AS eventType, message, severity, metadata_json AS metadataJson, created_at AS createdAt
-             FROM run_events WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT 200`,
-          [runId, cursor],
-        );
-        for (const row of rows) {
-          cursor = row.id;
-          send("run_event", row);
-        }
-        const statusRow = await first<{ status: string }>(env, "SELECT status FROM runs WHERE id = ?", [runId]);
-        if (statusRow && statusRow.status !== lastStatus) {
-          lastStatus = statusRow.status;
-          send("status", { status: lastStatus });
-        }
-        if (statusRow && TERMINAL.has(statusRow.status)) {
-          send("done", { status: statusRow.status });
+      while (!cancelled && Date.now() - startedAt < MAX_LIFETIME_MS) {
+        try {
+          const rows = await all<{ id: number; eventType: string; message: string; severity: string; metadataJson: string; createdAt: string }>(
+            env,
+            `SELECT id, event_type AS eventType, message, severity, metadata_json AS metadataJson, created_at AS createdAt
+               FROM run_events WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT 200`,
+            [runId, cursor],
+          );
+          for (const row of rows) {
+            cursor = row.id;
+            send("run_event", row);
+          }
+          const statusRow = await first<{ status: string }>(env, "SELECT status FROM runs WHERE id = ?", [runId]);
+          if (statusRow && statusRow.status !== lastStatus) {
+            lastStatus = statusRow.status;
+            send("status", { status: lastStatus });
+          }
+          if (statusRow && TERMINAL.has(statusRow.status)) {
+            send("done", { status: statusRow.status });
+            break;
+          }
+        } catch {
           break;
         }
         await new Promise((r) => setTimeout(r, 1500));
       }
       controller.close();
+    },
+    cancel() {
+      cancelled = true;
     },
   });
 
@@ -884,6 +892,10 @@ app.post("/api/internal/reclaim", async (c) => {
 // Container → worker live event stream. HMAC-gated (same scheme as /api/internal/status).
 // Body: { eventType, message, severity?, metadata? }. Writes run_events + bumps heartbeat.
 app.post("/api/internal/runs/:id/events", async (c) => {
+  const contentLength = Number(c.req.header("content-length") ?? "0");
+  if (contentLength > 1_000_000) {
+    return c.json({ error: "payload_too_large" }, 413);
+  }
   if (!(await verifyInternalRequest(c.req.raw, c.env))) {
     return c.json({ error: "unauthorized" }, 401);
   }

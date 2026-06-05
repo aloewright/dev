@@ -439,6 +439,19 @@ async function fetchPrComments(job, token, prNumber) {
 // "address_pr" mode: check out an existing PR branch, address its review comments,
 // resolve conflicts, make tests pass, push, and merge when green.
 async function handleAddressPr(job) {
+  callback = job.callbackBaseUrl && job.callbackSecret
+    ? { baseUrl: job.callbackBaseUrl.replace(/\/$/, ""), secret: job.callbackSecret, runId: job.runId }
+    : null;
+  startHeartbeat();
+  try {
+    return await handleAddressPrInner(job);
+  } finally {
+    stopHeartbeat();
+    callback = null;
+  }
+}
+
+async function handleAddressPrInner(job) {
   if (!job.runId || !job.repo?.owner || !job.repo?.repo || !job.prNumber) {
     return { ok: false, error: "missing_required_fields" };
   }
