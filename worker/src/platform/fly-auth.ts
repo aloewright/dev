@@ -41,7 +41,7 @@ const sessionCache = new Map<string, { user: FlyAuthUser; at: number }>();
 
 function sessionKey(cookie: string): string {
   const m = /better-auth\.session_token=([^;]+)/.exec(cookie);
-  return m ? m[1] : cookie;
+  return m?.[1] ?? cookie;
 }
 
 export async function getFlyAuthUser(request: Request, env: Env): Promise<FlyAuthUser | null> {
