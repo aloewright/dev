@@ -484,33 +484,46 @@ async function handleAddressPr(job) {
 // is really a secondary rate-limit isn't misread as a permanent permission failure.
 function classifyCloneError(stderr) {
   const s = stderr || "";
+  // Transient: rate-limit, network/TLS stream failures, 5xx. Checked BEFORE auth so a 403
+  // that is really a secondary rate-limit isn't mistaken for a permanent permission error.
   if (/\b429\b|rate limit|secondary rate|abuse detection|retry-after/i.test(s)) return "clone_transient_failed";
-  if (/GnuTLS|TLS connection|\bSSL\b|recv error|send error|early EOF|RPC failed|connection reset|Could not resolve host|Failed to connect|Connection timed out|timed out|certificate verification failed|unexpected disconnect|HTTP 5\d\d/i.test(s)) return "clone_transient_failed";
-  if (/\b40[13]\b|Authentication failed|Invalid username or token|not granted|Permission to .* denied|Permission denied|could not read Username|terminal prompts disabled|[Rr]epository\b[^\n]{0,200}not found/i.test(s)) return "clone_auth_failed";
+  if (/GnuTLS|gnutls|TLS connection|OpenSSL|SSL routines|SSL_read|SSL_write|\bSSL\b|recv error|send error|early EOF|unexpected eof|RPC failed|hung up|connection reset|reset by peer|was reset|Could not resolve host|Failed to connect|Connection refused|Connection timed out|timed out|certificate verification failed|Empty reply|transfer closed|unexpected disconnect|returned error: 5\d\d|HTTP 5\d\d/i.test(s)) return "clone_transient_failed";
+  // Permanent: a retry can't fix a token that can't reach the repo, or a disabled/suspended repo.
+  if (/\b40[13]\b|Authentication failed|Invalid username or token|password authentication|not granted|Permission to .* denied|Permission denied|could not read Username|terminal prompts disabled|[Rr]epository\b[^\n]{0,200}not found|is disabled|has been disabled|is suspended/i.test(s)) return "clone_auth_failed";
   return "clone_failed";
 }
 
 const CLONE_MAX_ATTEMPTS = 3;
 
 // Clone the repo, trying each candidate token once per attempt (the least-privilege App
-// token can 403 on repos it can't reach; a later token may authenticate). On an
-// all-tokens-failed result that is TRANSIENT, back off with jitter and retry the whole
-// set — same-second concurrent-clone bursts produce intermittent TLS resets that clear
-// on a retry. Auth failures stop immediately (a 403 won't fix itself). Returns
-// { code, activeToken, stderr }; activeToken is null on failure.
+// token can 403 on repos it can't reach; a later token may authenticate). After an
+// all-tokens-failed attempt, retry the whole set with jittered backoff UNLESS every token
+// failed with a permanent auth error — same-second concurrent-clone bursts produce
+// intermittent TLS resets that clear on a retry, and an unknown (non-auth) failure may be
+// transient too. Returns { code, activeToken, stderr, errorClass }; on failure errorClass
+// is the AGGREGATE verdict (transient if ANY token saw transient, generic if any non-auth,
+// else auth only when ALL tokens were auth) so a transient on the real token is not masked
+// by an auth failure on a fallback token.
 async function cloneWithRetry(runId, tokens, cloneUrlFor, repoDir, gitArgs) {
   let clone = { code: -1, stderr: "no token" };
+  let errorClass = "clone_failed";
   for (let attempt = 1; attempt <= CLONE_MAX_ATTEMPTS; attempt++) {
+    let sawTransient = false, sawOther = false;
     for (const tok of tokens) {
       clone = await exec("git", ["clone", ...gitArgs, cloneUrlFor(tok), repoDir], { timeoutMs: GIT_TIMEOUT_MS });
-      if (clone.code === 0) return { code: 0, activeToken: tok, stderr: "" };
-      step(runId, "clone:retry", { code: clone.code, attempt, errorClass: classifyCloneError(clone.stderr) });
+      if (clone.code === 0) return { code: 0, activeToken: tok, stderr: "", errorClass: null };
+      const c = classifyCloneError(clone.stderr);
+      if (c === "clone_transient_failed") sawTransient = true;
+      else if (c !== "clone_auth_failed") sawOther = true;
+      step(runId, "clone:retry", { code: clone.code, attempt, errorClass: c });
       await rm(repoDir, { recursive: true, force: true }).catch(() => {});
     }
-    if (classifyCloneError(clone.stderr) !== "clone_transient_failed" || attempt === CLONE_MAX_ATTEMPTS) break;
+    errorClass = sawTransient ? "clone_transient_failed" : sawOther ? "clone_failed" : "clone_auth_failed";
+    // Retry the whole set only if the failure could be transient (i.e. not pure-auth).
+    if (errorClass === "clone_auth_failed" || attempt === CLONE_MAX_ATTEMPTS) break;
     await sleep(1500 * attempt + Math.floor(Math.random() * 750));
   }
-  return { code: clone.code, activeToken: null, stderr: clone.stderr };
+  return { code: clone.code, activeToken: null, stderr: clone.stderr, errorClass };
 }
 
 async function handleAddressPrInner(job) {
@@ -529,7 +542,7 @@ async function handleAddressPrInner(job) {
     const clone = await cloneWithRetry(job.runId, tokens, cloneUrlFor, repoDir, []);
     const activeToken = clone.activeToken;
     if (!activeToken) {
-      const errorClass = classifyCloneError(clone.stderr);
+      const errorClass = clone.errorClass ?? classifyCloneError(clone.stderr);
       step(job.runId, "clone:failed", { code: clone.code, errorClass, mode: "address_pr" });
       return { ok: false, error: errorClass, logs: (clone.stderr || "").slice(-4000) };
     }
@@ -634,7 +647,7 @@ async function handleRunInner(rawBody) {
     const clone = await cloneWithRetry(job.runId, tokens, cloneUrlFor, repoDir, ["--depth=1"]);
     const activeToken = clone.activeToken;
     if (clone.code !== 0 || !activeToken) {
-      const errorClass = classifyCloneError(clone.stderr);
+      const errorClass = clone.errorClass ?? classifyCloneError(clone.stderr);
       step(job.runId, "clone:failed", { code: clone.code, errorClass });
       return { ok: false, error: errorClass, logs: (clone.stderr || "").slice(-4000) };
     }
