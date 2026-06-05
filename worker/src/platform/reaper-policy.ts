@@ -44,7 +44,7 @@ export function shouldRetryNoChanges(meta: Record<string, unknown>): boolean {
 export const MAX_STUCK_REDISPATCH = 20;
 
 export function reapKind(status: string): "stuck" | "error" {
-  return status === "running" || status === "queued" ? "stuck" : "error";
+  return status === "running" || status === "starting" || status === "queued" ? "stuck" : "error";
 }
 
 export function reapBudgetField(kind: "stuck" | "error"): "stuckRedispatch" | "retryCount" {
