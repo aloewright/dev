@@ -1,0 +1,86 @@
+[
+  {
+    "name": "brainstorming",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/brainstorming/SKILL.md",
+    "description": "You MUST use this before any creative work - creating features, building components, adding functionality, or modifying behavior. Explores user intent, requirements and design before implementation."
+  },
+  {
+    "name": "dispatching-parallel-agents",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/dispatching-parallel-agents/SKILL.md",
+    "description": "Use when facing 2+ independent tasks that can be worked on without shared state or sequential dependencies"
+  },
+  {
+    "name": "executing-plans",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/executing-plans/SKILL.md",
+    "description": "Use when you have a written implementation plan to execute in a separate session with review checkpoints"
+  },
+  {
+    "name": "finishing-a-development-branch",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/finishing-a-development-branch/SKILL.md",
+    "description": "Use when implementation is complete, all tests pass, and you need to decide how to integrate the work - guides completion of development work by presenting structured options for merge, PR, or cleanup"
+  },
+  {
+    "name": "receiving-code-review",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/receiving-code-review/SKILL.md",
+    "description": "Use when receiving code review feedback, before implementing suggestions, especially if feedback seems unclear or technically questionable - requires technical rigor and verification, not performative agreement or blind implementation"
+  },
+  {
+    "name": "requesting-code-review",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/requesting-code-review/SKILL.md",
+    "description": "Use when completing tasks, implementing major features, or before merging to verify work meets requirements"
+  },
+  {
+    "name": "subagent-driven-development",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/subagent-driven-development/SKILL.md",
+    "description": "Use when executing implementation plans with independent tasks in the current session"
+  },
+  {
+    "name": "systematic-debugging",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/systematic-debugging/SKILL.md",
+    "description": "Use when encountering any bug, test failure, or unexpected behavior, before proposing fixes"
+  },
+  {
+    "name": "test-driven-development",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/test-driven-development/SKILL.md",
+    "description": "Use when implementing any feature or bugfix, before writing implementation code"
+  },
+  {
+    "name": "using-git-worktrees",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/using-git-worktrees/SKILL.md",
+    "description": "Use when starting feature work that needs isolation from current workspace or before executing implementation plans - ensures an isolated workspace exists via native tools or git worktree fallback"
+  },
+  {
+    "name": "using-superpowers",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/using-superpowers/SKILL.md",
+    "description": "Use when starting any conversation - establishes how to find and use skills, requiring Skill tool invocation before ANY response including clarifying questions"
+  },
+  {
+    "name": "verification-before-completion",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/verification-before-completion/SKILL.md",
+    "description": "Use when about to claim work is complete, fixed, or passing, before committing or creating PRs - requires running verification commands and confirming output before making any success claims; evidence before assertions always"
+  },
+  {
+    "name": "writing-plans",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/writing-plans/SKILL.md",
+    "description": "Use when you have a spec or requirements for a multi-step task, before touching code"
+  },
+  {
+    "name": "writing-skills",
+    "r2_bucket": "fly-dev-template-assets",
+    "r2_key": "skills/superpowers/writing-skills/SKILL.md",
+    "description": "Use when creating new skills, editing existing skills, or verifying skills work before deployment"
+  }
+]

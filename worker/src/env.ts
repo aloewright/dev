@@ -102,6 +102,7 @@ export type Env = {
   // caps how many runs one Continue click starts. Both are non-secret vars.
   CONTINUE_AUTONOMY?: string;
   CONTINUE_EXECUTE_CAP?: string;
+  MAX_CONTAINER_INSTANCES?: string;
 };
 
 export type CurrentUser = {

@@ -506,3 +506,8 @@ async function repointUser(env: Env, table: string, intoUserId: string): Promise
     .run();
   return res.meta.changes ?? 0;
 }
+
+export async function getActiveRunCount(env: Env): Promise<number> {
+  const res = await first<{ count: number }>(env, "SELECT count(*) as count FROM runs WHERE status = 'running'");
+  return res?.count ?? 0;
+}

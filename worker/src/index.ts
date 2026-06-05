@@ -19,6 +19,8 @@ import {
   recordRunEvent,
   recordUsage,
   reclaimUserData,
+  getActiveRunCount,
+  runSql,
 } from "./platform/data";
 import {
   autoMapProjects,
@@ -39,6 +41,8 @@ import {
 import {
   approveRun,
   cancelRun,
+  retryTaskRun,
+  nextDispatchSeq,
   createTaskRun,
   enqueueRun,
   createTemplateApp,
@@ -51,8 +55,15 @@ import {
   type CreateTaskPayload,
 } from "./platform/orchestration";
 import { writeBackToLinear } from "./platform/linear";
-import { mergeWhenGreen } from "./platform/github";
+import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/github";
 import { continueProject } from "./platform/continue";
+import {
+  isRetryableError,
+  shouldRetryNoChanges,
+  reapKind,
+  reapBudgetField,
+  reapBudgetCap,
+} from "./platform/reaper-policy";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
 
@@ -562,6 +573,62 @@ app.post("/api/runs/:id/cancel", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
   return cancelRun(c.env, user, c.req.param("id"));
+});
+
+app.post("/api/runs/:id/retry", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return retryTaskRun(c.env, user, c.req.param("id"));
+});
+
+app.delete("/api/repos/:id", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const repoId = c.req.param("id");
+  const repo = await first<{ owner: string; name: string }>(
+    c.env,
+    "SELECT owner, name FROM github_repos WHERE id = ? AND user_id = ?",
+    [repoId, user.id],
+  );
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+
+  const token = await getDecryptedToken(c.env, user.id, "github");
+  if (!token) return c.json({ error: "GitHub connection required" }, 400);
+
+  const result = await deleteRepository(token, repo.owner, repo.name);
+  if (!result.ok) return c.json({ error: result.error }, 500);
+
+  await runSql(c.env, "DELETE FROM github_repos WHERE id = ? AND user_id = ?", [repoId, user.id]);
+  return c.json({ ok: true });
+});
+
+app.patch("/api/repos/:id", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const repoId = c.req.param("id");
+  const { name: newName } = (await c.req.json()) as { name: string };
+  if (!newName) return c.json({ error: "New name is required" }, 400);
+
+  const repo = await first<{ owner: string; name: string }>(
+    c.env,
+    "SELECT owner, name FROM github_repos WHERE id = ? AND user_id = ?",
+    [repoId, user.id],
+  );
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+
+  const token = await getDecryptedToken(c.env, user.id, "github");
+  if (!token) return c.json({ error: "GitHub connection required" }, 400);
+
+  const result = await renameRepository(token, repo.owner, repo.name, newName);
+  if (!result.ok) return c.json({ error: result.error }, 500);
+
+  await runSql(c.env, "UPDATE github_repos SET name = ?, full_name = ? WHERE id = ? AND user_id = ?", [
+    result.name!,
+    `${repo.owner}/${result.name!}`,
+    repoId,
+    user.id,
+  ]);
+  return c.json({ ok: true, name: result.name });
 });
 
 // Browsers navigating to /connect or /callback expect to land somewhere
@@ -1089,9 +1156,19 @@ export default {
   },
 
   async queue(batch: MessageBatch<WorkQueueMessage>, env: Env): Promise<void> {
+    const maxInstances = Number.parseInt(env.MAX_CONTAINER_INSTANCES ?? "8", 10);
+
     for (const message of batch.messages) {
       try {
         if (message.body.action === "start-run") {
+          // Check for open instances before releasing the execution.
+          const runningCount = await getActiveRunCount(env);
+          if (runningCount >= maxInstances) {
+            // No open instances: retry later.
+            message.retry();
+            continue;
+          }
+
           const run = await first<{ objective: string }>(
             env,
             "SELECT objective FROM runs WHERE id = ?",
@@ -1121,29 +1198,13 @@ export default {
   // recoverable error or got stuck mid-flight, so nothing simply sits in `failed`.
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     await reapStuckRuns(env);
+    await releaseOrphanedApprovals(env);
+    await retryNoChangeStragglers(env);
     await reapMergeablePRs(env);
   },
 };
 
-// Errors worth auto-retrying (infra/auth/transient). NOT no_changes (the agent
-// legitimately produced nothing) or no_repository (a config problem a retry can't fix).
-const RETRYABLE_ERRORS = [
-  "clone_failed",
-  "push_failed",
-  "pr_failed",
-  "commit_failed",
-  "no_github_token",
-  "agent_error",
-  "Container /run returned",
-  "exception",
-  "Agent produced no changes",
-];
-const MAX_RUN_RETRIES = 3;
 
-function isRetryableError(lastError: string | null): boolean {
-  if (!lastError) return false;
-  return RETRYABLE_ERRORS.some((needle) => lastError.includes(needle));
-}
 
 async function reapStuckRuns(env: Env): Promise<void> {
   // 1) Recently-failed runs with a retryable error, under the attempt cap.
@@ -1167,10 +1228,10 @@ async function reapStuckRuns(env: Env): Promise<void> {
   );
 
   for (const run of candidates) {
-    // 'running'/'queued' are stuck STATES (lost container / lost queue message),
-    // not error states, so they're always eligible regardless of last_error.
-    const stuckState = run.status === "running" || run.status === "queued";
-    if (!stuckState && !isRetryableError(run.last_error)) continue;
+    const kind = reapKind(run.status);
+    // Error retries require a retryable error; stuck states (capacity wait / lost queue
+    // message) are always eligible regardless of last_error.
+    if (kind === "error" && !isRetryableError(run.last_error)) continue;
 
     let meta: Record<string, unknown> = {};
     try {
@@ -1178,15 +1239,35 @@ async function reapStuckRuns(env: Env): Promise<void> {
     } catch {
       meta = {};
     }
-    const attempt = typeof meta.retryCount === "number" ? meta.retryCount : 0;
-    if (attempt >= MAX_RUN_RETRIES) continue;
-    const nextAttempt = attempt + 1;
-    meta.retryCount = nextAttempt;
 
-    // Flip back to queued only if still in the state we read (avoids racing a
-    // concurrently-recovering run).
+    // Error retries and capacity re-dispatches draw from SEPARATE budgets so a backlog
+    // draining through limited slots never falsely fails a run (see reaper-policy).
+    const field = reapBudgetField(kind);
+    const used = typeof meta[field] === "number" ? (meta[field] as number) : 0;
+    const cap = reapBudgetCap(kind);
+    if (used >= cap) {
+      // Don't strand it: if it's not already terminal, fail it loudly so it leaves
+      // the queue and surfaces for attention. Idempotent via meta.exhausted.
+      if (run.status !== "failed" && meta.exhausted !== true) {
+        meta.exhausted = true;
+        await env.DB.prepare(
+          `UPDATE runs SET status='failed', last_error='retries_exhausted', finished_at=CURRENT_TIMESTAMP, metadata_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`,
+        )
+          .bind(JSON.stringify(meta), run.id, run.status)
+          .run();
+        await recordRunEvent(env, run.id, "run.exhausted", `Auto-retry gave up after ${cap} ${kind} attempts (last: ${run.last_error ?? run.status}). Needs attention.`, "error");
+      }
+      continue;
+    }
+    meta[field] = used + 1;
+    const seq = nextDispatchSeq(meta);
+
+    // Reset started_at/finished_at so each attempt gets a FRESH 110-minute running clock.
+    // Otherwise COALESCE(started_at, …) in markRunStarted keeps the original timestamp and
+    // the next tick re-reaps the run as 'stuck running' seconds after it restarts.
+    // Flip only if still in the state we read (avoids racing a concurrent recovery).
     const updated = await env.DB.prepare(
-      `UPDATE runs SET status = 'queued', last_error = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+      `UPDATE runs SET status = 'queued', last_error = NULL, started_at = NULL, finished_at = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND status = ?`,
     )
       .bind(JSON.stringify(meta), run.id, run.status)
@@ -1197,16 +1278,120 @@ async function reapStuckRuns(env: Env): Promise<void> {
       env,
       run.id,
       "run.retry",
-      `Self-healing: auto-retry ${nextAttempt}/${MAX_RUN_RETRIES} after ${stuckState ? `stuck ${run.status}` : run.last_error}.`,
+      `Self-healing: ${kind} re-dispatch ${used + 1}/${cap} after ${kind === "stuck" ? `stuck ${run.status}` : run.last_error}.`,
       "info",
-      { attempt: nextAttempt },
+      { attempt: seq },
     );
     await enqueueRun(env, {
       runId: run.id,
       userId: run.user_id,
       projectId: run.project_id ?? undefined,
       action: "start-run",
-      attempt: nextAttempt,
+      attempt: seq,
+    });
+  }
+}
+
+// Approval-orphan reaper: when human approval is disabled, runs created during the
+// approval era sit in `waiting_approval` forever — the gate that parked them is gone.
+// Release them to `queued` and dispatch, mirroring approveRun (minus the human record).
+async function releaseOrphanedApprovals(env: Env): Promise<void> {
+  if (env.REQUIRE_HUMAN_APPROVAL === "true") return;
+  const orphans = await all<{
+    id: string;
+    user_id: string;
+    project_id: string | null;
+  }>(
+    env,
+    `SELECT id, user_id, project_id
+       FROM runs
+      WHERE status = 'waiting_approval'
+      ORDER BY created_at ASC
+      LIMIT 50`,
+  );
+
+  for (const run of orphans) {
+    // Status-guarded so we never race the approve endpoint or a concurrent tick.
+    const updated = await env.DB.prepare(
+      `UPDATE runs
+          SET status = 'queued', approval_required = 0, approved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'waiting_approval'`,
+    )
+      .bind(run.id)
+      .run();
+    if (!updated.meta.changes) continue;
+
+    await recordRunEvent(
+      env,
+      run.id,
+      "run.auto_released",
+      "Self-healing: approval gating disabled; orphaned run released to the queue.",
+      "info",
+    );
+    await enqueueRun(env, {
+      runId: run.id,
+      userId: run.user_id,
+      projectId: run.project_id ?? undefined,
+      action: "start-run",
+    });
+  }
+}
+
+// no_changes reaper: `no_changes` is normally terminal, but empty output produced
+// during a dead-OAuth-token window was auth — not the work being done. Give each such
+// run EXACTLY ONE recovery retry, marked in metadata so a genuine no-op never loops.
+async function retryNoChangeStragglers(env: Env): Promise<void> {
+  const rows = await all<{
+    id: string;
+    user_id: string;
+    project_id: string | null;
+    metadata_json: string;
+  }>(
+    env,
+    `SELECT id, user_id, project_id, metadata_json
+       FROM runs
+      WHERE status = 'failed' AND last_error = 'no_changes'
+      ORDER BY updated_at ASC
+      LIMIT 50`,
+  );
+
+  for (const run of rows) {
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = JSON.parse(run.metadata_json) as Record<string, unknown>;
+    } catch {
+      meta = {};
+    }
+    if (!shouldRetryNoChanges(meta)) continue;
+    meta.noChangesRetried = true;
+    // A one-time recovery, bounded by the marker above — it does NOT consume the error
+    // budget. It DOES need a fresh dispatch sequence: the run already ran once on the
+    // bare `${runId}` instance, so re-enqueuing without one would idempotently no-op.
+    const seq = nextDispatchSeq(meta);
+
+    const updated = await env.DB.prepare(
+      `UPDATE runs
+          SET status = 'queued', last_error = NULL, started_at = NULL, finished_at = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'failed' AND last_error = 'no_changes'`,
+    )
+      .bind(JSON.stringify(meta), run.id)
+      .run();
+    if (!updated.meta.changes) continue;
+
+    await recordRunEvent(
+      env,
+      run.id,
+      "run.retry",
+      "Self-healing: one-time retry of a no_changes run (possible auth-window empty output).",
+      "info",
+      { attempt: seq },
+    );
+    await enqueueRun(env, {
+      runId: run.id,
+      userId: run.user_id,
+      projectId: run.project_id ?? undefined,
+      action: "start-run",
+      attempt: seq,
     });
   }
 }
@@ -1255,6 +1440,14 @@ async function reapMergeablePRs(env: Env): Promise<void> {
       reason: "exception",
     }));
     meta.mergeAttempts = attempts + 1;
+    if (result.reason === "draft" || result.reason === "tests_failing") {
+      const draftAttempts = (typeof meta.draftAttempts === "number" ? meta.draftAttempts : 0) + 1;
+      meta.draftAttempts = draftAttempts;
+      if (draftAttempts >= 3) {
+        meta.mergeDone = true; // stop polling; it won't merge until a human/agent fixes it
+        await recordRunEvent(env, run.id, "merge.parked", `PR #${prNum} is a draft / tests failing after ${draftAttempts} checks — parked, needs attention.`, "warn");
+      }
+    }
     if (result.merged || ("alreadyMerged" in result && result.alreadyMerged)) {
       meta.mergeDone = true;
     }

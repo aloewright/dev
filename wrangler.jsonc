@@ -147,7 +147,7 @@
       // standard-2 (1 vCPU / 6 GiB / 12 GB disk) — clone + node CLIs need more
       // than the default lite (256 MiB / 2 GB). See SANDBOX_REVIEW.md §C item 7.
       "instance_type": "standard-2",
-      "max_instances": 15
+      "max_instances": 8
     }
   ],
   "vars": {
@@ -163,6 +163,7 @@
     "GITHUB_APP_ID": "3899646",
     "AUTH_HUB_URL": "https://auth.fly.pm",
     "CONTINUE_AUTONOMY": "true",
-    "CONTINUE_EXECUTE_CAP": "3"
+    "CONTINUE_EXECUTE_CAP": "3",
+    "MAX_CONTAINER_INSTANCES": "8"
   }
 }
