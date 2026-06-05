@@ -61,10 +61,12 @@ import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/g
 import { continueProject } from "./platform/continue";
 import {
   isRetryableError,
+  isCapacityError,
   shouldRetryNoChanges,
   reapKind,
   reapBudgetField,
   reapBudgetCap,
+  MAX_STUCK_REDISPATCH,
 } from "./platform/reaper-policy";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
@@ -1122,21 +1124,98 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
     const repo = plan.repo;
     const linearIssueId = plan.linearIssueId;
 
-    await step.do("start sandbox container", async () => {
-      const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
-      const container = getContainer(containerNamespace, sandboxId);
-      try {
-        await container.startAndWaitForPorts([8080], {
-          instanceGetTimeoutMS: 30_000,
-          portReadyTimeoutMS: 60_000,
-          waitInterval: 1_000,
-        });
-      } catch (error) {
-        await markRunFailed(this.env, payload.runId, new Error(`container_start_failed: ${String(error)}`));
-        throw error;
-      }
-      await markRunReady(this.env, payload.runId);
-    });
+    const startResult = await step.do(
+      "start sandbox container",
+      async (): Promise<{ requeued?: boolean; exhausted?: boolean }> => {
+        const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
+        const container = getContainer(containerNamespace, sandboxId);
+        try {
+          await container.startAndWaitForPorts([8080], {
+            instanceGetTimeoutMS: 30_000,
+            portReadyTimeoutMS: 60_000,
+            waitInterval: 1_000,
+          });
+        } catch (error) {
+          // Transient container-capacity errors (the platform has no free instance up to
+          // max_instances) must NOT burn the error budget or strand the run — bounded-
+          // requeue them on the stuck budget so the run flows back through the queue when
+          // capacity frees. Non-capacity errors keep failing fast.
+          if (isCapacityError(String(error))) {
+            const row = await first<{ metadata_json: string }>(
+              this.env,
+              "SELECT metadata_json FROM runs WHERE id = ?",
+              [payload.runId],
+            );
+            let meta: Record<string, unknown> = {};
+            try {
+              meta = JSON.parse(row?.metadata_json ?? "{}") as Record<string, unknown>;
+            } catch {
+              meta = {};
+            }
+            const used = typeof meta.stuckRedispatch === "number" ? meta.stuckRedispatch : 0;
+
+            if (used >= MAX_STUCK_REDISPATCH) {
+              // Out of capacity budget: fail terminally and mark exhausted so the reaper
+              // treats it as terminal rather than re-dispatching forever. Do NOT rethrow.
+              meta.exhausted = true;
+              await markRunFailed(this.env, payload.runId, new Error("capacity_exhausted"));
+              await runSql(
+                this.env,
+                "UPDATE runs SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                [JSON.stringify(meta), payload.runId],
+              );
+              return { requeued: false, exhausted: true };
+            }
+
+            // Bounded requeue: bump the stuck budget, flip the run back to queued with a
+            // fresh clock, and re-enqueue so a future consumer invocation re-creates the
+            // workflow once a container slot is free.
+            meta.stuckRedispatch = used + 1;
+            const seq = nextDispatchSeq(meta);
+            await runSql(
+              this.env,
+              `UPDATE runs
+                 SET status = 'queued', started_at = NULL, last_heartbeat_at = NULL,
+                     last_error = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?`,
+              [JSON.stringify(meta), payload.runId],
+            );
+            await recordRunEvent(
+              this.env,
+              payload.runId,
+              "container.requeue",
+              `No free container slot; bounded-requeue ${used + 1}/${MAX_STUCK_REDISPATCH} (capacity).`,
+              "warn",
+              { attempt: seq },
+            );
+            await enqueueRun(this.env, {
+              runId: payload.runId,
+              userId: payload.userId,
+              projectId: payload.projectId,
+              action: "start-run",
+              attempt: seq,
+            });
+            return { requeued: true };
+          }
+          await markRunFailed(this.env, payload.runId, new Error(`container_start_failed: ${String(error)}`));
+          throw error;
+        }
+        await markRunReady(this.env, payload.runId);
+        return {};
+      },
+    );
+
+    // Capacity bounded-requeue (or terminal exhaustion) stops the workflow cleanly here.
+    // A fresh workflow is created later by the consumer when a slot frees (requeued), or
+    // the run is terminal (exhausted). markRunReady only ran on the success path above.
+    if (startResult?.requeued || startResult?.exhausted) {
+      return {
+        runId: payload.runId,
+        sandboxId,
+        status: startResult.exhausted ? "failed" : "requeued",
+        reason: "capacity",
+      };
+    }
 
     // Credentials are resolved and used inside this single step so they are
     // never returned from a step (never persisted in Workflow storage). See S6.
