@@ -35,7 +35,7 @@ export async function createOAuthConnectUrl(
     const url = new URL("https://github.com/login/oauth/authorize");
     url.searchParams.set("client_id", env.GITHUB_CLIENT_ID!);
     url.searchParams.set("redirect_uri", redirectUri);
-    url.searchParams.set("scope", "repo read:org read:user user:email workflow");
+    url.searchParams.set("scope", "repo delete_repo read:org read:user user:email workflow");
     url.searchParams.set("state", state);
     return { setupRequired: false, provider, url: url.toString() };
   }

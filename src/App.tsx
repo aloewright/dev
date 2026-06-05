@@ -1012,7 +1012,11 @@ function RepoRow({ repo }: { repo: Overview["repos"][number] }) {
                 }
                 disabled={deleteRepo.isPending}
                 onClick={() => {
-                  if (confirm(`Are you sure you want to delete ${repo.fullName} from GitHub?`)) {
+                  if (
+                    confirm(
+                      `Are you sure you want to delete ${repo.fullName} from GitHub? THIS CANNOT BE UNDONE.`,
+                    )
+                  ) {
                     deleteRepo.mutate();
                   }
                 }}
@@ -1023,6 +1027,14 @@ function RepoRow({ repo }: { repo: Overview["repos"][number] }) {
           </Menu>
         </Group>
       </Group>
+
+      {deleteRepo.error || renameRepo.error ? (
+        <Box px="lg" pb="sm">
+          <Alert color="red" variant="light" title="GitHub operation failed">
+            {deleteRepo.error?.message || renameRepo.error?.message}
+          </Alert>
+        </Box>
+      ) : null}
 
       <Modal opened={editing} onClose={() => setEditing(false)} title="Rename repository" centered>
         <Stack gap="md">
@@ -1081,59 +1093,69 @@ function RunRow({ run }: { run: Overview["recentRuns"][number] }) {
   const active = run.status === "running" || run.status === "queued";
 
   return (
-    <Group justify="space-between" px="lg" py="sm" style={rowBorder} wrap="wrap">
-      <Box style={{ minWidth: 0, flex: 1 }}>
-        <Text size="sm" fw={600} truncate>
-          {run.objective}
-        </Text>
-        <Text size="xs" c="dimmed" truncate>
-          {run.projectName ?? run.id}
-        </Text>
-      </Box>
-      <Group gap="xs">
-        <StatusBadge status={run.status} />
-        <StatusBadge status={run.agentProvider} />
-      </Group>
-      {waiting ? (
+    <>
+      <Group justify="space-between" px="lg" py="sm" style={rowBorder} wrap="wrap">
+        <Box style={{ minWidth: 0, flex: 1 }}>
+          <Text size="sm" fw={600} truncate>
+            {run.objective}
+          </Text>
+          <Text size="xs" c="dimmed" truncate>
+            {run.projectName ?? run.id}
+          </Text>
+        </Box>
         <Group gap="xs">
-          <Button
-            size="xs"
-            color="teal"
-            loading={approve.isPending}
-            onClick={() => approve.mutate()}
-          >
-            Approve
-          </Button>
-          <Button
-            size="xs"
-            variant="subtle"
-            color="gray"
-            loading={cancel.isPending}
-            onClick={() => cancel.mutate()}
-          >
-            Cancel
-          </Button>
+          <StatusBadge status={run.status} />
+          <StatusBadge status={run.agentProvider} />
         </Group>
-      ) : (
-        <Group gap="xs">
-          {!active && (
+        {waiting ? (
+          <Group gap="xs">
             <Button
               size="xs"
-              variant="light"
-              color="indigo"
-              leftSection={<IconRefresh style={{ width: 14, height: 14 }} />}
-              loading={retry.isPending}
-              onClick={() => retry.mutate()}
+              color="teal"
+              loading={approve.isPending}
+              onClick={() => approve.mutate()}
             >
-              Retry
+              Approve
             </Button>
-          )}
-          <Text size="sm" c="dimmed">
-            {run.approvalRequired ? "approval" : active ? run.status : "done"}
-          </Text>
-        </Group>
-      )}
-    </Group>
+            <Button
+              size="xs"
+              variant="subtle"
+              color="gray"
+              loading={cancel.isPending}
+              onClick={() => cancel.mutate()}
+            >
+              Cancel
+            </Button>
+          </Group>
+        ) : (
+          <Group gap="xs">
+            {!active && (
+              <Button
+                size="xs"
+                variant="light"
+                color="indigo"
+                leftSection={<IconRefresh style={{ width: 14, height: 14 }} />}
+                loading={retry.isPending}
+                onClick={() => retry.mutate()}
+              >
+                Retry
+              </Button>
+            )}
+            <Text size="sm" c="dimmed">
+              {run.approvalRequired ? "approval" : active ? run.status : "done"}
+            </Text>
+          </Group>
+        )}
+      </Group>
+
+      {approve.error || cancel.error || retry.error ? (
+        <Box px="lg" pb="sm">
+          <Alert color="red" variant="light" title="Operation failed">
+            {approve.error?.message || cancel.error?.message || retry.error?.message}
+          </Alert>
+        </Box>
+      ) : null}
+    </>
   );
 }
 
