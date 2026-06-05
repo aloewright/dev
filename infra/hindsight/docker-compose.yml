@@ -1,0 +1,79 @@
+name: hindsight
+
+# Self-hosted Hindsight agent-memory engine for fly-dev.
+# Embeddings: LOCAL (bundled BGE in the full image) — no external embedding service.
+# Chat (retain/reflect): routed through the Cloudflare AI Gateway /compat endpoint.
+# Reachable only via cloudflared tunnel + Cloudflare Access (no public ingress).
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${HINDSIGHT_DB_USER:-hindsight_user}
+      POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in .env}
+      POSTGRES_DB: ${HINDSIGHT_DB_NAME:-hindsight_db}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - /mnt/hindsight-data/pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HINDSIGHT_DB_USER:-hindsight_user} -d ${HINDSIGHT_DB_NAME:-hindsight_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [hindsight-net]
+
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8888:8888"   # REST API; cloudflared reaches it on loopback. NOT public.
+    environment:
+      # ---- Postgres ----
+      HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight_user}:${HINDSIGHT_DB_PASSWORD}@db:5432/${HINDSIGHT_DB_NAME:-hindsight_db}
+      HINDSIGHT_API_VECTOR_EXTENSION: pgvector
+      HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP: "true"
+
+      # ---- Tenant auth (inner layer; CF Access is the outer layer) ----
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY:?set HINDSIGHT_API_TENANT_API_KEY in .env}
+
+      # ---- Background worker + auto-consolidation ----
+      HINDSIGHT_API_WORKER_ENABLED: "true"
+      HINDSIGHT_API_WORKER_ID: hindsight-prod
+
+      # ---- Embeddings: LOCAL bundled BGE (no gateway, no LiteLLM) ----
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+
+      # ---- Chat (retain extraction) -> CF AI Gateway /compat, DIRECT ----
+      # The CF AI Gateway accepts its token via the standard Authorization: Bearer
+      # header, so we pass CF_AIG_TOKEN as the api_key. (This Hindsight build ignores
+      # HINDSIGHT_API_LLM_DEFAULT_HEADERS, so cf-aig-authorization can't be sent that
+      # way — verified: Authorization: Bearer <CF_AIG_TOKEN> returns 200.)
+      # NOTE: cf-aig-zdr can't be sent per-request here; enable Zero-Data-Retention /
+      # disable logs at the GATEWAY level for gateway "x" instead. See README.
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID:?set CF_ACCOUNT_ID}/${CF_GATEWAY_ID:-x}/compat
+      HINDSIGHT_API_LLM_API_KEY: ${CF_AIG_TOKEN:?set CF_AIG_TOKEN}
+      HINDSIGHT_API_LLM_MODEL: dynamic/text_gen
+
+      # ---- Reflect override: deep-reasoning route ----
+      HINDSIGHT_API_REFLECT_LLM_PROVIDER: openai
+      HINDSIGHT_API_REFLECT_LLM_BASE_URL: https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_GATEWAY_ID:-x}/compat
+      HINDSIGHT_API_REFLECT_LLM_API_KEY: ${CF_AIG_TOKEN}
+      HINDSIGHT_API_REFLECT_LLM_MODEL: dynamic/research_gen
+
+      # ---- Server ----
+      HINDSIGHT_API_HOST: 0.0.0.0
+      HINDSIGHT_API_PORT: "8888"
+      HINDSIGHT_API_LOG_LEVEL: info
+    networks: [hindsight-net]
+
+networks:
+  hindsight-net:
+    driver: bridge

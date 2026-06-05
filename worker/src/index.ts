@@ -5,7 +5,14 @@ import { Hono } from "hono";
 import { DurableObject, WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import type { ContainerRunResult, CurrentUser, Env, RunWorkflowParams, WorkQueueMessage } from "./env";
+import type { ContainerRunResult, CurrentUser, Env, MemoryRetainMessage, RunWorkflowParams, WorkQueueMessage } from "./env";
+import {
+  getMemoryProvider,
+  bankKeyFor,
+  formatRecallForPrompt,
+  enqueueMemoryRetain,
+} from "./platform/memory";
+import { summarizeRunForMemory } from "./platform/run-summary";
 import { getCurrentUser, requireUser, verifyInternalRequest } from "./platform/auth-session";
 import { hubLoginRedirect } from "./platform/fly-auth";
 import {
@@ -91,7 +98,15 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-app.get("/api/health", (c) => {
+app.get("/api/health", async (c) => {
+  // Opt-in live reachability probe for the memory engine (kept off the default path
+  // so the cheap health check stays cheap): /api/health?probe=memory
+  let memoryProbe: { configured: boolean; reachable?: boolean; detail?: string } | undefined;
+  if (c.req.query("probe") === "memory") {
+    const configured = c.env.MEMORY_ENABLED === "true" && Boolean(c.env.HINDSIGHT_BASE_URL);
+    const h = configured ? await getMemoryProvider(c.env).health() : { ok: false, detail: "disabled" };
+    memoryProbe = { configured, reachable: h.ok, detail: h.detail };
+  }
   return c.json({
     ok: true,
     service: "fly-dev",
@@ -101,11 +116,14 @@ app.get("/api/health", (c) => {
       r2: Boolean(c.env.ARTIFACTS),
       kv: Boolean(c.env.CACHE),
       queue: Boolean(c.env.WORK_QUEUE),
+      memoryQueue: Boolean(c.env.MEMORY_QUEUE),
       workflow: Boolean(c.env.RUN_WORKFLOW),
       userWorkers: Boolean(c.env.USER_WORKERS),
       aiGateway: Boolean(c.env.AI),
       browser: Boolean(c.env.MYBROWSER),
+      memory: c.env.MEMORY_ENABLED === "true" && Boolean(c.env.HINDSIGHT_BASE_URL),
     },
+    ...(memoryProbe ? { memory: memoryProbe } : {}),
     timestamp: new Date().toISOString(),
   });
 });
@@ -1304,6 +1322,28 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
       if (!creds.githubToken) {
         return { ok: false, error: "no_github_token" };
       }
+      // Recall prior memories for this project and inject as priorContext. Strictly
+      // best-effort: any failure yields "" and the run proceeds exactly as before.
+      let priorContext = "";
+      try {
+        const memory = getMemoryProvider(this.env);
+        const bank = bankKeyFor(payload.userId, plan.projectId ?? payload.projectId);
+        const [recalled, playbook] = await Promise.all([
+          memory.recall({ bank, query: plan.objective, limit: 5 }),
+          memory.mentalModel(bank),
+        ]);
+        priorContext = formatRecallForPrompt(recalled, playbook);
+        await recordRunEvent(
+          this.env,
+          payload.runId,
+          "memory.recall",
+          priorContext ? "Recalled prior memories + playbook." : "No prior memories.",
+          "info",
+          { bank, hadContext: Boolean(priorContext) },
+        ).catch(() => {});
+      } catch {
+        priorContext = "";
+      }
       const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
       const container = getContainer(containerNamespace, sandboxId);
       const response = await container.fetch(
@@ -1313,6 +1353,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
           body: JSON.stringify({
             runId: payload.runId,
             objective: plan.objective,
+            priorContext,
             agentProvider: plan.agentProvider,
             mode: plan.mode ?? "implement",
             prNumber: plan.prNumber,
@@ -1382,6 +1423,38 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
         unit: "minute",
         provider: "cloudflare-containers",
       });
+
+      // Retain this run's outcome to agent memory. Off-the-hot-path via MEMORY_QUEUE
+      // (the network call happens in the consumer); this step only reads events +
+      // enqueues, both failure-tolerant, so it can never fail the run.
+      const status = result.ok ? "completed" : "failed";
+      const events = await all<{ event_type: string; message: string }>(
+        this.env,
+        "SELECT event_type, message FROM run_events WHERE run_id = ? ORDER BY id ASC",
+        [payload.runId],
+      );
+      const record = summarizeRunForMemory(
+        { id: payload.runId, objective: plan.objective, projectName: null, status },
+        events.map((e) => ({ eventType: e.event_type, message: e.message })),
+        {
+          ok: result.ok,
+          prUrl: result.prUrl ?? undefined,
+          summary: result.summary ?? undefined,
+          error: result.error ?? undefined,
+        },
+      );
+      const projectId = plan.projectId ?? payload.projectId ?? null;
+      await enqueueMemoryRetain(this.env, {
+        kind: "retain",
+        runId: payload.runId,
+        userId: payload.userId,
+        projectId,
+        bank: bankKeyFor(payload.userId, projectId),
+        content: result.prUrl ? `${record.content}\nPR: ${result.prUrl}` : record.content,
+        context: { ...record.context, outcome: record.outcome, projectId },
+        tags: [status, "fly-dev", ...(projectId ? [projectId] : [])],
+        ts: Date.now(),
+      });
     });
 
     if (result.ok && linearIssueId) {
@@ -1435,7 +1508,13 @@ export default {
     return app.fetch(request, env, ctx);
   },
 
-  async queue(batch: MessageBatch<WorkQueueMessage>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<WorkQueueMessage | MemoryRetainMessage>, env: Env): Promise<void> {
+    // Agent-memory retains run on their own queue, decoupled from run admission.
+    if (batch.queue === "fly-dev-memory") {
+      await consumeMemoryRetains(batch as MessageBatch<MemoryRetainMessage>, env);
+      return;
+    }
+    const workBatch = batch as MessageBatch<WorkQueueMessage>;
     const maxInstances = Number.parseInt(env.MAX_CONTAINER_INSTANCES ?? "8", 10);
 
     // Read the live active-run count ONCE per batch, then reserve slots locally as we
@@ -1445,7 +1524,7 @@ export default {
     const baseActive = await getActiveRunCount(env);
     let reservedThisBatch = 0;
 
-    for (const message of batch.messages) {
+    for (const message of workBatch.messages) {
       try {
         if (message.body.action === "start-run") {
           // Gate on the count we read once plus what we've already reserved in this
@@ -1490,8 +1569,81 @@ export default {
     await releaseOrphanedApprovals(env);
     await retryNoChangeStragglers(env);
     await reapMergeablePRs(env);
+    await reflectMemoryBanks(env);
   },
 };
+
+// Consumes the fly-dev-memory queue: call the MemoryProvider.retain, then mirror the
+// result into the agent_memories ledger. Throw on retain failure so the queue retries
+// (→ DLQ after max_retries); the run that produced the memory already completed.
+async function consumeMemoryRetains(batch: MessageBatch<MemoryRetainMessage>, env: Env): Promise<void> {
+  const memory = getMemoryProvider(env);
+  for (const message of batch.messages) {
+    try {
+      const m = message.body;
+      // First retain to a bank: ensure config + standing playbook exist (once per bank).
+      const setupKey = `memory:bank-init:${m.bank}`;
+      if (!(await env.CACHE.get(setupKey))) {
+        await memory.ensureBank(m.bank);
+        await env.CACHE.put(setupKey, "1", { expirationTtl: 60 * 60 * 24 * 30 }).catch(() => {});
+      }
+      const res = await memory.retain({
+        bank: m.bank,
+        content: m.content,
+        context: m.context,
+        tags: m.tags,
+        ts: m.ts,
+      });
+      if (!res.ok) throw new Error(res.error ?? "retain_failed");
+      // Mirror into the local ledger (best-effort; never re-throw — retain succeeded).
+      await runSql(
+        env,
+        `INSERT INTO agent_memories
+           (id, user_id, project_id, session_id, memory_type, title, content, source, metadata_json, hindsight_id, bank_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id("mem"),
+          m.userId,
+          m.projectId ?? null,
+          m.runId,
+          "run_outcome",
+          `Run ${m.runId} (${String(m.context.outcome ?? "?")})`.slice(0, 200),
+          m.content,
+          "run",
+          JSON.stringify(m.context),
+          res.hindsightId ?? null,
+          m.bank,
+        ],
+      ).catch(() => {});
+      message.ack();
+    } catch {
+      message.retry();
+    }
+  }
+}
+
+// Optional explicit reflect nudge. Default mode "auto" relies on Hindsight's own
+// consolidation-triggered mental-model refresh, so this is a no-op unless the
+// operator sets MEMORY_REFLECT_MODE="cron". Throttled per bank via CACHE.
+async function reflectMemoryBanks(env: Env): Promise<void> {
+  if (env.MEMORY_REFLECT_MODE !== "cron" || env.MEMORY_ENABLED !== "true") return;
+  try {
+    const memory = getMemoryProvider(env);
+    const banks = await all<{ bank_key: string }>(
+      env,
+      `SELECT DISTINCT bank_key FROM agent_memories
+       WHERE bank_key IS NOT NULL AND updated_at > datetime('now', '-1 day') LIMIT 25`,
+    );
+    for (const { bank_key } of banks) {
+      const throttleKey = `memory:reflect:${bank_key}`;
+      if (await env.CACHE.get(throttleKey)) continue;
+      await memory.reflect({ bank: bank_key, query: "Refresh the project playbook from recent runs." });
+      await env.CACHE.put(throttleKey, "1", { expirationTtl: 60 * 60 * 6 }).catch(() => {});
+    }
+  } catch {
+    /* best-effort */
+  }
+}
 
 
 

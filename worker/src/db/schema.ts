@@ -185,6 +185,8 @@ export const agentMemories = sqliteTable("agent_memories", {
   content: text("content").notNull(),
   source: text("source").notNull().default("session"),
   metadataJson: text("metadata_json").notNull().default("{}"),
+  hindsightId: text("hindsight_id"),
+  bankKey: text("bank_key"),
   createdAt: text("created_at").notNull().default("CURRENT_TIMESTAMP"),
   updatedAt: text("updated_at").notNull().default("CURRENT_TIMESTAMP"),
 });

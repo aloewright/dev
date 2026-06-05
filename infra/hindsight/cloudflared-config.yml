@@ -1,0 +1,11 @@
+# /etc/cloudflared/config.yml on the VM. Replace <UUID> with the tunnel id from
+# `cloudflared tunnel create hindsight`. Routes hindsight.fly.pm -> loopback API only.
+tunnel: <UUID>
+credentials-file: /root/.cloudflared/<UUID>.json
+
+ingress:
+  - hostname: hindsight.fly.pm
+    service: http://127.0.0.1:8888
+    originRequest:
+      connectTimeout: 30s
+  - service: http_status:404
