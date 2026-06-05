@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHmac } from "node:crypto";
 import { createThrottle } from "./event-throttle.mjs";
+import { classifyAgentFailure } from "./agent-failure.mjs";
 
 // Per-run live callback config, set at the start of handleRun.
 let callback = null; // { baseUrl, secret, runId }
@@ -32,17 +33,26 @@ async function emit(rawEventType, message, severity = "info", metadata = {}) {
     const body = JSON.stringify({ eventType, message: String(message ?? "").slice(0, 2000), severity, metadata });
     const timestamp = String(Date.now());
     const signature = createHmac("sha256", callback.secret).update(`${timestamp}.${body}`).digest("hex");
-    const res = await fetch(`${callback.baseUrl}/api/internal/runs/${callback.runId}/events`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-fly-timestamp": timestamp,
-        "x-fly-signature": signature,
-      },
-      body,
-    });
-    if (!res.ok) {
-      console.error(`emit_status ${eventType}: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 120)}`);
+    // Cap the callback at 5s so a hung/looping worker endpoint can't accumulate sockets
+    // or delay the run; an abort surfaces as an AbortError in the outer catch (emit_failed).
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 5000);
+    try {
+      const res = await fetch(`${callback.baseUrl}/api/internal/runs/${callback.runId}/events`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-fly-timestamp": timestamp,
+          "x-fly-signature": signature,
+        },
+        body,
+        signal: ac.signal,
+      });
+      if (!res.ok) {
+        console.error(`emit_status ${eventType}: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 120)}`);
+      }
+    } finally {
+      clearTimeout(to);
     }
   } catch (err) {
     // Best-effort: failures never break the run, but log so we can diagnose egress/TLS.
@@ -613,10 +623,25 @@ async function handleRunInner(rawBody) {
       // (non-zero exit — e.g. expired Claude OAuth token, crash). The latter is
       // retryable and worth surfacing distinctly.
       const errored = agent.code !== 0;
-      step(job.runId, errored ? "agent_error" : "no_changes", { exitCode: agent.code });
+      if (errored) {
+        // Don't lump every non-zero exit into 'agent_error'. Classify so the reaper can
+        // treat rate-limits (surface, don't burn budget), timeouts (bounded retry), and
+        // auth (surface) distinctly. See container/agent-failure.mjs.
+        const cls = classifyAgentFailure(agent.code, agent.stdout, agent.stderr);
+        step(job.runId, cls.error, { exitCode: agent.code, retryAfter: cls.retryAfter ?? undefined });
+        return {
+          ok: false,
+          error: cls.error,
+          retryAfter: cls.retryAfter ?? undefined,
+          agentExitCode: agent.code,
+          summary,
+          logs,
+        };
+      }
+      step(job.runId, "no_changes", { exitCode: agent.code });
       return {
         ok: false,
-        error: errored ? "agent_error" : "no_changes",
+        error: "no_changes",
         agentExitCode: agent.code,
         summary,
         logs,
