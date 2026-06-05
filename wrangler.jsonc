@@ -156,9 +156,11 @@
     {
       "class_name": "SandboxContainer",
       "image": "./container/Dockerfile",
-      // standard-2 (1 vCPU / 6 GiB / 12 GB disk) — clone + node CLIs need more
-      // than the default lite (256 MiB / 2 GB). See SANDBOX_REVIEW.md §C item 7.
-      "instance_type": "standard-2",
+      // standard-3 (2 vCPU / 8 GiB / 16 GB disk). Upgraded from standard-2 — more
+      // CPU/disk for the clone + agent + test gate, and a different capacity pool
+      // than the constrained standard-2 (which was returning "no free slot").
+      // Wrangler allows ONE instance_type per container; this is a switch, not an add.
+      "instance_type": "standard-3",
       "max_instances": 8
     }
   ],
