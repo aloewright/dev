@@ -722,6 +722,33 @@ app.patch("/api/repos/:id", async (c) => {
   return c.json({ ok: true, name: result.name });
 });
 
+// Maintenance: force-stop sandbox containers that outlived their run (orphaned/idle
+// instances occupying the few container slots). Auth: the signed-in @fly.pm user.
+// Body: { runIds: string[] }. Stops the container for each `run-<runId>` sandbox.
+app.post("/api/maintenance/stop-containers", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const body = (await c.req.json().catch(() => ({}))) as { runIds?: string[] };
+  const runIds = Array.isArray(body.runIds) ? body.runIds.slice(0, 50) : [];
+  const ns = c.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
+  const results: Array<{ runId: string; ok: boolean; error?: string }> = [];
+  for (const runId of runIds) {
+    try {
+      await getContainer(ns, `run-${runId}`).stop();
+      results.push({ runId, ok: true });
+    } catch (e) {
+      // Fall back to a hard kill if a graceful stop isn't accepted.
+      try {
+        await getContainer(ns, `run-${runId}`).destroy();
+        results.push({ runId, ok: true });
+      } catch (e2) {
+        results.push({ runId, ok: false, error: String(e2 ?? e) });
+      }
+    }
+  }
+  return c.json({ stopped: results.filter((r) => r.ok).length, results });
+});
+
 // Browsers navigating to /connect or /callback expect to land somewhere
 // usable. If the user isn't signed in (or the OAuth state expired), don't
 // dump a raw JSON error into the address bar — bounce them back to the
@@ -1284,6 +1311,18 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
         throw new Error(`Container /run returned HTTP ${response.status}`);
       }
       return (await response.json()) as ContainerRunResult;
+    });
+
+    // Free the container slot immediately — otherwise it lingers RUNNING until
+    // sleepAfter (120m, which must cover the agent run), orphaning one of the few
+    // slots and starving the queue. Best-effort: sleepAfter is the backstop.
+    await step.do("stop sandbox container", async () => {
+      try {
+        const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
+        await getContainer(containerNamespace, sandboxId).stop();
+      } catch {
+        // ignore — the run already produced its result; sleepAfter cleans up eventually
+      }
     });
 
     await step.do("record agent result", async () => {
