@@ -11,7 +11,13 @@
     // navigations (otherwise "/" -> index.html is served by assets directly,
     // bypassing the gate). The catch-all serves static sub-resources via the
     // ASSETS binding after the gate check.
-    "run_worker_first": true
+    "run_worker_first": true,
+    // SPA routing: the default "auto-trailing-slash" 302-redirects /index.html and
+    // any client route (e.g. /command-center) toward "/", so deep links bounced to
+    // the dashboard. "none" stops those redirects; "single-page-application" serves
+    // index.html (200) for any unmatched path so the client router renders the route.
+    "html_handling": "none",
+    "not_found_handling": "single-page-application"
   },
   "routes": [
     {
