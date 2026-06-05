@@ -22,8 +22,11 @@ const outputThrottle = createThrottle(1000, () => Date.now(), new Set([
 ]));
 
 // Sign + POST a single event to the worker. Best-effort: failures never break the run.
-async function emit(eventType, message, severity = "info", metadata = {}) {
+async function emit(rawEventType, message, severity = "info", metadata = {}) {
   if (!callback?.baseUrl || !callback?.secret) return;
+  // Normalize colon-style stage names (clone:start) to the dotted taxonomy
+  // (clone.start) so the always-pass set and the UI prefix coloring both match.
+  const eventType = String(rawEventType ?? "").replace(/:/g, ".");
   if (!outputThrottle(eventType)) return;
   try {
     const body = JSON.stringify({ eventType, message: String(message ?? "").slice(0, 2000), severity, metadata });
