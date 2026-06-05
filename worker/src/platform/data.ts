@@ -508,6 +508,22 @@ async function repointUser(env: Env, table: string, intoUserId: string): Promise
 }
 
 export async function getActiveRunCount(env: Env): Promise<number> {
-  const res = await first<{ count: number }>(env, "SELECT count(*) as count FROM runs WHERE status = 'running'");
+  // Count both transient `starting` and `running` so the 8-slot gate is never
+  // over-subscribed while a container is booting.
+  const res = await first<{ count: number }>(
+    env,
+    "SELECT count(*) as count FROM runs WHERE status IN ('starting','running')",
+  );
   return res?.count ?? 0;
+}
+
+// Bump liveness on every container event/heartbeat. Only affects active runs so a
+// late callback after completion cannot resurrect timestamps on a terminal row.
+export async function bumpHeartbeat(env: Env, runId: string): Promise<void> {
+  await runSql(
+    env,
+    `UPDATE runs SET last_heartbeat_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND status IN ('starting','running')`,
+    [runId],
+  );
 }
