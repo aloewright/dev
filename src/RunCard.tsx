@@ -12,7 +12,9 @@ const STATUS_COLOR: Record<string, string> = {
   running: "teal", starting: "indigo", queued: "gray", failed: "red", completed: "teal", cancelled: "gray",
 };
 
-export function RunCard({ run }: { run: ActiveRun }) {
+const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+
+export function RunCard({ run, onFinished }: { run: ActiveRun; onFinished?: (id: string) => void }) {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [status, setStatus] = useState(run.status);
   const viewport = useRef<HTMLDivElement>(null);
@@ -26,10 +28,18 @@ export function RunCard({ run }: { run: ActiveRun }) {
       const row = JSON.parse((e as MessageEvent).data) as RunEvent;
       setEvents((prev) => [...prev.slice(-199), row]);
     });
-    es.addEventListener("status", (e) => setStatus((JSON.parse((e as MessageEvent).data) as { status: string }).status));
-    es.addEventListener("done", () => es.close());
+    es.addEventListener("status", (e) => {
+      const next = (JSON.parse((e as MessageEvent).data) as { status: string }).status;
+      setStatus(next);
+      // Once the run reaches a terminal state, drop it from the Command Center immediately.
+      if (TERMINAL.has(next)) onFinished?.(run.id);
+    });
+    es.addEventListener("done", () => {
+      es.close();
+      onFinished?.(run.id);
+    });
     return () => es.close();
-  }, [run.id]);
+  }, [run.id, onFinished]);
 
   useEffect(() => {
     viewport.current?.scrollTo({ top: viewport.current.scrollHeight });
