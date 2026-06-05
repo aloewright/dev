@@ -15,6 +15,10 @@ export const RETRYABLE_ERRORS = [
   "commit_failed",
   "no_github_token",
   "agent_error",
+  // A timeout (SIGKILL 143/137 from AGENT_TIMEOUT_MS or container teardown) is worth a
+  // bounded retry on the MAX_RUN_RETRIES error budget. Deliberately NOT claude_rate_limited:
+  // a rate-limited run must SURFACE as failed rather than blindly retry and re-hit the limit.
+  "agent_timeout",
   "Container /run returned",
   "exception",
   "Agent produced no changes",
