@@ -739,11 +739,36 @@ async function handleRunInner(rawBody) {
   }
 }
 
+// Each sandbox is SINGLE-USE (sandboxId = run-<runId>, never reused). We track the
+// one in-flight /run so we can exit the process the moment it finishes — this frees
+// the platform instance slot immediately instead of lingering until sleepAfter (120m)
+// and orphaning a slot. It also self-heals deploy orphans: if a `wrangler deploy`
+// resets the RunWorkflow DO mid-run, this container still exits when its /run ends.
+let runInFlight = false;
+
+function scheduleExit() {
+  try {
+    server.close();
+  } catch {
+    /* already closing */
+  }
+  // Grace window: let the Container DO finish relaying the /run response body back to
+  // the Worker, and any final emit() callback flush, before the process dies.
+  setTimeout(() => process.exit(0), 2500);
+}
+
 const server = http.createServer(async (request, response) => {
   if (request.url === "/ready") {
     return sendJson(response, 200, { ok: true, runtime: "fly-dev-sandbox" });
   }
   if (request.method === "POST" && request.url === "/run") {
+    runInFlight = true;
+    // Self-exit AFTER the response is fully flushed (covers success, no_changes,
+    // exception, and address_pr — all return through this single sendJson).
+    response.on("finish", () => {
+      runInFlight = false;
+      scheduleExit();
+    });
     try {
       const body = await readBody(request);
       let parsed = null;
@@ -761,3 +786,13 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, "0.0.0.0");
+
+// Node runs as PID 1 here (exec-form CMD), which has NO default signal handling —
+// without these, a worker-initiated stop() (SIGTERM) is silently ignored and the
+// instance lingers. Drain gracefully: exit now if idle; if a run is in flight, let
+// the /run `finish` self-exit handle it (never SIGTERM-kill the agent mid-run).
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    if (!runInFlight) scheduleExit();
+  });
+}

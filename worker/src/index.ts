@@ -733,17 +733,27 @@ app.post("/api/maintenance/stop-containers", async (c) => {
   const ns = c.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
   const results: Array<{ runId: string; ok: boolean; error?: string }> = [];
   for (const runId of runIds) {
+    // Safety: never hard-kill a genuinely-active run's container. Only orphans
+    // (terminal/queued in D1, or stale-heartbeat) are eligible.
+    const run = await first<{ status: string; last_heartbeat_at: string | null }>(
+      c.env,
+      "SELECT status, last_heartbeat_at FROM runs WHERE id = ?",
+      [runId],
+    );
+    const hb = run?.last_heartbeat_at ? Date.parse(`${run.last_heartbeat_at.replace(" ", "T")}Z`) : 0;
+    const activeHealthy =
+      run && (run.status === "running" || run.status === "starting") && hb > Date.now() - 120_000;
+    if (activeHealthy) {
+      results.push({ runId, ok: false, error: "skipped: run is active and heartbeating" });
+      continue;
+    }
+    // destroy() (SIGKILL) is reliable; stop() (SIGTERM) is a no-op on a process that
+    // ignores SIGTERM. Neither can START a container (verified in @cloudflare/containers).
     try {
-      await getContainer(ns, `run-${runId}`).stop();
+      await getContainer(ns, `run-${runId}`).destroy();
       results.push({ runId, ok: true });
     } catch (e) {
-      // Fall back to a hard kill if a graceful stop isn't accepted.
-      try {
-        await getContainer(ns, `run-${runId}`).destroy();
-        results.push({ runId, ok: true });
-      } catch (e2) {
-        results.push({ runId, ok: false, error: String(e2 ?? e) });
-      }
+      results.push({ runId, ok: false, error: String(e) });
     }
   }
   return c.json({ stopped: results.filter((r) => r.ok).length, results });
@@ -1503,15 +1513,10 @@ async function reapStuckRuns(env: Env): Promise<void> {
     // message) are always eligible regardless of last_error.
     if (kind === "error" && !isRetryableError(run.last_error)) continue;
 
-    // The run's workflow is dead/stalled or it's being re-dispatched — stop any lingering
-    // container BEFORE a fresh attempt. Otherwise deploy/crash-orphaned containers (whose
-    // workflow was reset out from under them) pile up and occupy the few slots. Best-effort.
-    try {
-      const ns = env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
-      await getContainer(ns, `run-${run.id}`).stop();
-    } catch {
-      // no container / already stopped — ignore
-    }
+    // NOTE: we deliberately do NOT touch the container here. Containers self-exit when
+    // their /run finishes (container/server.mjs), so deploy/crash orphans clean
+    // themselves. Calling getContainer(...).stop() on the SAME sandboxId we're about to
+    // re-dispatch only churns the DO (and stop() is a no-op vs a SIGTERM-handling exit).
 
     let meta: Record<string, unknown> = {};
     try {
