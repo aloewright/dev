@@ -20,6 +20,7 @@ import {
   recordUsage,
   reclaimUserData,
   getActiveRunCount,
+  bumpHeartbeat,
   runSql,
 } from "./platform/data";
 import {
@@ -821,6 +822,34 @@ app.post("/api/internal/reclaim", async (c) => {
   const counts = await reclaimUserData(c.env, body.intoUserId);
   const mapped = await autoMapProjects(c.env, body.intoUserId).catch(() => null);
   return c.json({ ok: true, ...counts, mapped });
+});
+
+// Container → worker live event stream. HMAC-gated (same scheme as /api/internal/status).
+// Body: { eventType, message, severity?, metadata? }. Writes run_events + bumps heartbeat.
+app.post("/api/internal/runs/:id/events", async (c) => {
+  if (!(await verifyInternalRequest(c.req.raw, c.env))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const runId = c.req.param("id");
+  let body: { eventType?: string; message?: string; severity?: string; metadata?: Record<string, unknown> };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  if (!body.eventType || typeof body.eventType !== "string") {
+    return c.json({ error: "missing_event_type" }, 400);
+  }
+  await recordRunEvent(
+    c.env,
+    runId,
+    body.eventType,
+    typeof body.message === "string" ? body.message.slice(0, 2000) : "",
+    body.severity === "error" || body.severity === "warn" ? body.severity : "info",
+    body.metadata && typeof body.metadata === "object" ? body.metadata : {},
+  );
+  await bumpHeartbeat(c.env, runId);
+  return c.json({ ok: true });
 });
 
 // Sign-out. Login lives entirely on the fly.pm hub (auth.fly.pm), which owns the
