@@ -170,6 +170,10 @@
     "AUTH_HUB_URL": "https://auth.fly.pm",
     "CONTINUE_AUTONOMY": "true",
     "CONTINUE_EXECUTE_CAP": "3",
-    "MAX_CONTAINER_INSTANCES": "8"
+    // Queue-admission gate. MUST match the account's REAL provisionable container
+    // concurrency, NOT the max_instances ceiling. Measured 2026-06-05: the platform
+    // only ever brings up ~1 standard-2 sandbox at a time; gating above that admits
+    // doomed workflows that spin through the requeue budget and die capacity_exhausted.
+    "MAX_CONTAINER_INSTANCES": "1"
   }
 }
