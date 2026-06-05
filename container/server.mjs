@@ -11,6 +11,62 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHmac } from "node:crypto";
+import { createThrottle } from "./event-throttle.mjs";
+import { classifyAgentFailure } from "./agent-failure.mjs";
+
+// Per-run live callback config, set at the start of handleRun.
+let callback = null; // { baseUrl, secret, runId }
+let heartbeatTimer = null;
+const outputThrottle = createThrottle(1000, () => Date.now(), new Set([
+  "clone.start", "clone.done", "agent.start", "agent.done", "tests", "push", "pr.opened", "agent.result",
+]));
+
+// Sign + POST a single event to the worker. Best-effort: failures never break the run.
+async function emit(rawEventType, message, severity = "info", metadata = {}) {
+  if (!callback?.baseUrl || !callback?.secret) return;
+  // Normalize colon-style stage names (clone:start) to the dotted taxonomy
+  // (clone.start) so the always-pass set and the UI prefix coloring both match.
+  const eventType = String(rawEventType ?? "").replace(/:/g, ".");
+  if (!outputThrottle(eventType)) return;
+  try {
+    const body = JSON.stringify({ eventType, message: String(message ?? "").slice(0, 2000), severity, metadata });
+    const timestamp = String(Date.now());
+    const signature = createHmac("sha256", callback.secret).update(`${timestamp}.${body}`).digest("hex");
+    // Cap the callback at 5s so a hung/looping worker endpoint can't accumulate sockets
+    // or delay the run; an abort surfaces as an AbortError in the outer catch (emit_failed).
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 5000);
+    try {
+      const res = await fetch(`${callback.baseUrl}/api/internal/runs/${callback.runId}/events`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-fly-timestamp": timestamp,
+          "x-fly-signature": signature,
+        },
+        body,
+        signal: ac.signal,
+      });
+      if (!res.ok) {
+        console.error(`emit_status ${eventType}: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 120)}`);
+      }
+    } finally {
+      clearTimeout(to);
+    }
+  } catch (err) {
+    // Best-effort: failures never break the run, but log so we can diagnose egress/TLS.
+    console.error(`emit_failed ${eventType} -> ${callback.baseUrl}: ${String(err?.cause ?? err)}`);
+  }
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => { void emit("heartbeat", "", "info"); }, 15_000);
+}
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
 
 const PORT = Number(process.env.PORT ?? 8080);
 // 250 turns can run long; keep the cap generous so the agent is never SIGKILLed
@@ -43,6 +99,7 @@ function tail(text, n = 3000) {
 // where a run is and how long each stage took.
 function step(runId, stage, extra = {}) {
   console.log(JSON.stringify({ t: new Date().toISOString(), runId, stage, ...extra }));
+  void emit(stage, extra.message ?? "", extra.severity ?? "info", extra);
 }
 
 function exec(cmd, args, opts = {}) {
@@ -396,6 +453,19 @@ async function fetchPrComments(job, token, prNumber) {
 // "address_pr" mode: check out an existing PR branch, address its review comments,
 // resolve conflicts, make tests pass, push, and merge when green.
 async function handleAddressPr(job) {
+  callback = job.callbackBaseUrl && job.callbackSecret
+    ? { baseUrl: job.callbackBaseUrl.replace(/\/$/, ""), secret: job.callbackSecret, runId: job.runId }
+    : null;
+  startHeartbeat();
+  try {
+    return await handleAddressPrInner(job);
+  } finally {
+    stopHeartbeat();
+    callback = null;
+  }
+}
+
+async function handleAddressPrInner(job) {
   if (!job.runId || !job.repo?.owner || !job.repo?.repo || !job.prNumber) {
     return { ok: false, error: "missing_required_fields" };
   }
@@ -469,6 +539,15 @@ async function handleAddressPr(job) {
 }
 
 async function handleRun(rawBody) {
+  try {
+    return await handleRunInner(rawBody);
+  } finally {
+    stopHeartbeat();
+    callback = null;
+  }
+}
+
+async function handleRunInner(rawBody) {
   let job;
   try {
     job = JSON.parse(rawBody);
@@ -478,6 +557,11 @@ async function handleRun(rawBody) {
   if (!job.runId || !job.objective || !job.repo?.owner || !job.repo?.repo || !job.githubToken) {
     return { ok: false, error: "missing_required_fields" };
   }
+
+  callback = job.callbackBaseUrl && job.callbackSecret
+    ? { baseUrl: job.callbackBaseUrl.replace(/\/$/, ""), secret: job.callbackSecret, runId: job.runId }
+    : null;
+  startHeartbeat();
 
   // Detected from the clone — never assume "main" (many repos default to master).
   let baseBranch = job.repo.baseBranch || "main";
@@ -539,10 +623,25 @@ async function handleRun(rawBody) {
       // (non-zero exit — e.g. expired Claude OAuth token, crash). The latter is
       // retryable and worth surfacing distinctly.
       const errored = agent.code !== 0;
-      step(job.runId, errored ? "agent_error" : "no_changes", { exitCode: agent.code });
+      if (errored) {
+        // Don't lump every non-zero exit into 'agent_error'. Classify so the reaper can
+        // treat rate-limits (surface, don't burn budget), timeouts (bounded retry), and
+        // auth (surface) distinctly. See container/agent-failure.mjs.
+        const cls = classifyAgentFailure(agent.code, agent.stdout, agent.stderr);
+        step(job.runId, cls.error, { exitCode: agent.code, retryAfter: cls.retryAfter ?? undefined });
+        return {
+          ok: false,
+          error: cls.error,
+          retryAfter: cls.retryAfter ?? undefined,
+          agentExitCode: agent.code,
+          summary,
+          logs,
+        };
+      }
+      step(job.runId, "no_changes", { exitCode: agent.code });
       return {
         ok: false,
-        error: errored ? "agent_error" : "no_changes",
+        error: "no_changes",
         agentExitCode: agent.code,
         summary,
         logs,

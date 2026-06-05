@@ -15,9 +15,20 @@ export const RETRYABLE_ERRORS = [
   "commit_failed",
   "no_github_token",
   "agent_error",
+  // A timeout (SIGKILL 143/137 from AGENT_TIMEOUT_MS or container teardown) is worth a
+  // bounded retry on the MAX_RUN_RETRIES error budget. Deliberately NOT claude_rate_limited:
+  // a rate-limited run must SURFACE as failed rather than blindly retry and re-hit the limit.
+  "agent_timeout",
   "Container /run returned",
   "exception",
   "Agent produced no changes",
+  // Container-capacity failures are normally bounded-requeued at container-start (see
+  // isCapacityError + the workflow's "start sandbox container" step). These two are a
+  // SAFETY NET: if a capacity failure ever lands in status='failed' via a path the
+  // bounded requeue missed, the reaper still picks it up via the budget rather than
+  // stranding the run.
+  "Maximum number of running container instances",
+  "The container is not running",
 ];
 
 export const MAX_RUN_RETRIES = 5;
@@ -25,6 +36,20 @@ export const MAX_RUN_RETRIES = 5;
 export function isRetryableError(lastError: string | null): boolean {
   if (!lastError) return false;
   return RETRYABLE_ERRORS.some((needle) => lastError.includes(needle));
+}
+
+// Transient container-capacity errors: the platform has no free instance (max_instances).
+// These must REQUEUE (stuck budget), never burn the error budget or strand the run.
+const CAPACITY_ERRORS = [
+  "Maximum number of running container instances",
+  "The container is not running",
+  "there is no container instance",
+  "no container instance",
+];
+
+export function isCapacityError(lastError: string | null): boolean {
+  if (!lastError) return false;
+  return CAPACITY_ERRORS.some((needle) => lastError.includes(needle));
 }
 
 // `no_changes` is normally terminal — a clean signal that the issue had no work. But a
@@ -44,7 +69,7 @@ export function shouldRetryNoChanges(meta: Record<string, unknown>): boolean {
 export const MAX_STUCK_REDISPATCH = 20;
 
 export function reapKind(status: string): "stuck" | "error" {
-  return status === "running" || status === "queued" ? "stuck" : "error";
+  return status === "running" || status === "starting" || status === "queued" ? "stuck" : "error";
 }
 
 export function reapBudgetField(kind: "stuck" | "error"): "stuckRedispatch" | "retryCount" {

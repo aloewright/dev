@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isRetryableError,
+  isCapacityError,
   shouldRetryNoChanges,
   MAX_RUN_RETRIES,
   MAX_STUCK_REDISPATCH,
@@ -21,6 +22,25 @@ describe("isRetryableError", () => {
     expect(isRetryableError("no_changes")).toBe(false);
     expect(isRetryableError("no_repository")).toBe(false);
     expect(isRetryableError(null)).toBe(false);
+  });
+
+  it("treats container-capacity failures as retryable (safety net for any that land in failed)", () => {
+    expect(
+      isRetryableError(
+        "container_start_failed: Error: The container is not running, consider calling start()",
+      ),
+    ).toBe(true);
+    expect(isRetryableError("Maximum number of running container instances reached")).toBe(true);
+  });
+});
+
+describe("isCapacityError", () => {
+  it("matches the container capacity / not-running strings", () => {
+    expect(isCapacityError("container_start_failed: Error: The container is not running, consider calling start()")).toBe(true);
+    expect(isCapacityError("Maximum number of running container instances reached")).toBe(true);
+    expect(isCapacityError("there is no container instance available")).toBe(true);
+    expect(isCapacityError(null)).toBe(false);
+    expect(isCapacityError("agent_error")).toBe(false);
   });
 });
 

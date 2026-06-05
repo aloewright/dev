@@ -20,6 +20,7 @@ import {
   recordUsage,
   reclaimUserData,
   getActiveRunCount,
+  bumpHeartbeat,
   runSql,
 } from "./platform/data";
 import {
@@ -48,7 +49,8 @@ import {
   createTemplateApp,
   markRunCompleted,
   markRunFailed,
-  markRunStarted,
+  markRunStarting,
+  markRunReady,
   prepareRunCredentials,
   resolveRunPlan,
   startRunWorkflow,
@@ -59,10 +61,12 @@ import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/g
 import { continueProject } from "./platform/continue";
 import {
   isRetryableError,
+  isCapacityError,
   shouldRetryNoChanges,
   reapKind,
   reapBudgetField,
   reapBudgetCap,
+  MAX_STUCK_REDISPATCH,
 } from "./platform/reaper-policy";
 import { dispatchFromGitHubWebhook, dispatchFromLinearWebhook } from "./platform/webhook-dispatch";
 import { redactSecrets } from "./platform/crypto";
@@ -553,6 +557,71 @@ app.get("/api/runs/:id/events", async (c) => {
   return c.json({ events });
 });
 
+// Server-sent events: live run event stream for the Command Center. Polls D1 by
+// id-cursor and pushes new rows; closes on terminal status or after a max lifetime.
+app.get("/api/runs/:id/events/stream", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const runId = c.req.param("id");
+  const owned = await first<{ id: string }>(
+    c.env,
+    "SELECT id FROM runs WHERE id = ? AND user_id = ?",
+    [runId, user.id],
+  );
+  if (!owned) return c.json({ error: "Run not found" }, 404);
+
+  const env = c.env;
+  const encoder = new TextEncoder();
+  const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+  const MAX_LIFETIME_MS = 15 * 60 * 1000;
+
+  let cancelled = false;
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: unknown) =>
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      let cursor = 0;
+      let lastStatus = "";
+      const startedAt = Date.now();
+      send("open", { runId });
+      while (!cancelled && Date.now() - startedAt < MAX_LIFETIME_MS) {
+        try {
+          const rows = await all<{ id: number; eventType: string; message: string; severity: string; metadataJson: string; createdAt: string }>(
+            env,
+            `SELECT id, event_type AS eventType, message, severity, metadata_json AS metadataJson, created_at AS createdAt
+               FROM run_events WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT 200`,
+            [runId, cursor],
+          );
+          for (const row of rows) {
+            cursor = row.id;
+            send("run_event", row);
+          }
+          const statusRow = await first<{ status: string }>(env, "SELECT status FROM runs WHERE id = ?", [runId]);
+          if (statusRow && statusRow.status !== lastStatus) {
+            lastStatus = statusRow.status;
+            send("status", { status: lastStatus });
+          }
+          if (statusRow && TERMINAL.has(statusRow.status)) {
+            send("done", { status: statusRow.status });
+            break;
+          }
+        } catch {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      controller.close();
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
+  });
+});
+
 app.post("/api/tasks", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
@@ -822,6 +891,38 @@ app.post("/api/internal/reclaim", async (c) => {
   return c.json({ ok: true, ...counts, mapped });
 });
 
+// Container → worker live event stream. HMAC-gated (same scheme as /api/internal/status).
+// Body: { eventType, message, severity?, metadata? }. Writes run_events + bumps heartbeat.
+app.post("/api/internal/runs/:id/events", async (c) => {
+  const contentLength = Number(c.req.header("content-length") ?? "0");
+  if (contentLength > 1_000_000) {
+    return c.json({ error: "payload_too_large" }, 413);
+  }
+  if (!(await verifyInternalRequest(c.req.raw, c.env))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const runId = c.req.param("id");
+  let body: { eventType?: string; message?: string; severity?: string; metadata?: Record<string, unknown> };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  if (!body.eventType || typeof body.eventType !== "string") {
+    return c.json({ error: "missing_event_type" }, 400);
+  }
+  await recordRunEvent(
+    c.env,
+    runId,
+    body.eventType,
+    typeof body.message === "string" ? body.message.slice(0, 2000) : "",
+    body.severity === "error" || body.severity === "warn" ? body.severity : "info",
+    body.metadata && typeof body.metadata === "object" ? body.metadata : {},
+  );
+  await bumpHeartbeat(c.env, runId);
+  return c.json({ ok: true });
+});
+
 // Sign-out. Login lives entirely on the fly.pm hub (auth.fly.pm), which owns the
 // .fly.pm session cookie, so sign-out must happen there. Redirect to the hub's
 // /logout, which clears the cookie fleet-wide and bounces back to the login page.
@@ -987,6 +1088,8 @@ export class SandboxContainer extends Container<Env> {
     "files.pythonhosted.org",
     "proxy.golang.org",
     "sum.golang.org",
+    // Worker origin for the live-event callback (POST /api/internal/runs/:id/events).
+    "dev.fly.pm",
   ];
   pingEndpoint = "localhost:8080/ready";
 }
@@ -1000,7 +1103,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
 
     const sandboxId = await step.do("reserve sandbox", async () => {
       const sandboxIdValue = `run-${payload.runId}`;
-      await markRunStarted(this.env, payload.runId, sandboxIdValue);
+      await markRunStarting(this.env, payload.runId, sandboxIdValue);
       return sandboxIdValue;
     });
 
@@ -1021,15 +1124,98 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
     const repo = plan.repo;
     const linearIssueId = plan.linearIssueId;
 
-    await step.do("start sandbox container", async () => {
-      const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
-      const container = getContainer(containerNamespace, sandboxId);
-      await container.startAndWaitForPorts([8080], {
-        instanceGetTimeoutMS: 30_000,
-        portReadyTimeoutMS: 60_000,
-        waitInterval: 1_000,
-      });
-    });
+    const startResult = await step.do(
+      "start sandbox container",
+      async (): Promise<{ requeued?: boolean; exhausted?: boolean }> => {
+        const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
+        const container = getContainer(containerNamespace, sandboxId);
+        try {
+          await container.startAndWaitForPorts([8080], {
+            instanceGetTimeoutMS: 30_000,
+            portReadyTimeoutMS: 60_000,
+            waitInterval: 1_000,
+          });
+        } catch (error) {
+          // Transient container-capacity errors (the platform has no free instance up to
+          // max_instances) must NOT burn the error budget or strand the run — bounded-
+          // requeue them on the stuck budget so the run flows back through the queue when
+          // capacity frees. Non-capacity errors keep failing fast.
+          if (isCapacityError(String(error))) {
+            const row = await first<{ metadata_json: string }>(
+              this.env,
+              "SELECT metadata_json FROM runs WHERE id = ?",
+              [payload.runId],
+            );
+            let meta: Record<string, unknown> = {};
+            try {
+              meta = JSON.parse(row?.metadata_json ?? "{}") as Record<string, unknown>;
+            } catch {
+              meta = {};
+            }
+            const used = typeof meta.stuckRedispatch === "number" ? meta.stuckRedispatch : 0;
+
+            if (used >= MAX_STUCK_REDISPATCH) {
+              // Out of capacity budget: fail terminally and mark exhausted so the reaper
+              // treats it as terminal rather than re-dispatching forever. Do NOT rethrow.
+              meta.exhausted = true;
+              await markRunFailed(this.env, payload.runId, new Error("capacity_exhausted"));
+              await runSql(
+                this.env,
+                "UPDATE runs SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                [JSON.stringify(meta), payload.runId],
+              );
+              return { requeued: false, exhausted: true };
+            }
+
+            // Bounded requeue: bump the stuck budget, flip the run back to queued with a
+            // fresh clock, and re-enqueue so a future consumer invocation re-creates the
+            // workflow once a container slot is free.
+            meta.stuckRedispatch = used + 1;
+            const seq = nextDispatchSeq(meta);
+            await runSql(
+              this.env,
+              `UPDATE runs
+                 SET status = 'queued', started_at = NULL, last_heartbeat_at = NULL,
+                     last_error = NULL, metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?`,
+              [JSON.stringify(meta), payload.runId],
+            );
+            await recordRunEvent(
+              this.env,
+              payload.runId,
+              "container.requeue",
+              `No free container slot; bounded-requeue ${used + 1}/${MAX_STUCK_REDISPATCH} (capacity).`,
+              "warn",
+              { attempt: seq },
+            );
+            await enqueueRun(this.env, {
+              runId: payload.runId,
+              userId: payload.userId,
+              projectId: payload.projectId,
+              action: "start-run",
+              attempt: seq,
+            });
+            return { requeued: true };
+          }
+          await markRunFailed(this.env, payload.runId, new Error(`container_start_failed: ${String(error)}`));
+          throw error;
+        }
+        await markRunReady(this.env, payload.runId);
+        return {};
+      },
+    );
+
+    // Capacity bounded-requeue (or terminal exhaustion) stops the workflow cleanly here.
+    // A fresh workflow is created later by the consumer when a slot frees (requeued), or
+    // the run is terminal (exhausted). markRunReady only ran on the success path above.
+    if (startResult?.requeued || startResult?.exhausted) {
+      return {
+        runId: payload.runId,
+        sandboxId,
+        status: startResult.exhausted ? "failed" : "requeued",
+        reason: "capacity",
+      };
+    }
 
     // Credentials are resolved and used inside this single step so they are
     // never returned from a step (never persisted in Workflow storage). See S6.
@@ -1056,6 +1242,8 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
             linearToken: creds.linearToken,
             aiGateway: creds.aiGateway,
             claudeOauthToken: creds.claudeOauthToken,
+            callbackBaseUrl: this.env.APP_URL,
+            callbackSecret: this.env.INTERNAL_API_SECRET ?? "",
           }),
         }),
       );
@@ -1158,13 +1346,19 @@ export default {
   async queue(batch: MessageBatch<WorkQueueMessage>, env: Env): Promise<void> {
     const maxInstances = Number.parseInt(env.MAX_CONTAINER_INSTANCES ?? "8", 10);
 
+    // Read the live active-run count ONCE per batch, then reserve slots locally as we
+    // admit each start-run. With max_concurrency:1 (wrangler.jsonc) the queue runs one
+    // consumer invocation at a time, so a single read-then-reserve loop is the whole
+    // admission gate — no two invocations can both read a stale count and over-admit.
+    const baseActive = await getActiveRunCount(env);
+    let reservedThisBatch = 0;
+
     for (const message of batch.messages) {
       try {
         if (message.body.action === "start-run") {
-          // Check for open instances before releasing the execution.
-          const runningCount = await getActiveRunCount(env);
-          if (runningCount >= maxInstances) {
-            // No open instances: retry later.
+          // Gate on the count we read once plus what we've already reserved in this
+          // batch. No free slot → retry later (the message redelivers).
+          if (baseActive + reservedThisBatch >= maxInstances) {
             message.retry();
             continue;
           }
@@ -1174,6 +1368,9 @@ export default {
             "SELECT objective FROM runs WHERE id = ?",
             [message.body.runId],
           );
+          // Reserve the slot BEFORE dispatching so a throw mid-dispatch doesn't let the
+          // next message in this batch reuse the slot we were about to consume.
+          reservedThisBatch++;
           await startRunWorkflow(env, {
             runId: message.body.runId,
             userId: message.body.userId,
@@ -1216,12 +1413,13 @@ async function reapStuckRuns(env: Env): Promise<void> {
     status: string;
     last_error: string | null;
     metadata_json: string;
+    last_heartbeat_at: string | null;
   }>(
     env,
-    `SELECT id, user_id, project_id, status, last_error, metadata_json
+    `SELECT id, user_id, project_id, status, last_error, metadata_json, last_heartbeat_at
        FROM runs
       WHERE (status = 'failed'  AND finished_at >= datetime('now','-6 hours'))
-         OR (status = 'running' AND started_at  <= datetime('now','-110 minutes'))
+         OR (status IN ('running','starting') AND COALESCE(last_heartbeat_at, started_at) <= datetime('now','-8 minutes'))
          OR (status = 'queued'  AND updated_at  <= datetime('now','-15 minutes'))
       ORDER BY updated_at ASC
       LIMIT 50`,

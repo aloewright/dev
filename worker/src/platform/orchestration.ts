@@ -297,17 +297,34 @@ export async function enqueueRun(env: Env, message: WorkQueueMessage): Promise<v
   await env.WORK_QUEUE.send(message);
 }
 
-export async function markRunStarted(env: Env, runId: string, sandboxId: string): Promise<void> {
+// Reserve the slot: container requested but not yet confirmed up. Sets the first
+// heartbeat so the stall window starts counting from the request, not from never.
+export async function markRunStarting(env: Env, runId: string, sandboxId: string): Promise<void> {
   await runSql(
     env,
     `UPDATE runs
-     SET status = 'running', sandbox_id = ?, started_at = COALESCE(started_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
+       SET status = 'starting', sandbox_id = ?,
+           started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+           last_heartbeat_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
     [sandboxId, runId],
   );
   await recordRunEvent(env, runId, "container.start", "Sandbox container start requested.", "info", {
     sandboxId,
   });
+}
+
+// Ports are ready and the run is dispatched: promote to running.
+export async function markRunReady(env: Env, runId: string): Promise<void> {
+  await runSql(
+    env,
+    `UPDATE runs
+       SET status = 'running', last_heartbeat_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND status = 'starting'`,
+    [runId],
+  );
+  await recordRunEvent(env, runId, "container.ready", "Sandbox container ready; dispatching.", "info");
 }
 
 export async function markRunCompleted(
