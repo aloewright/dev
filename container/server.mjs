@@ -11,6 +11,45 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHmac } from "node:crypto";
+import { createThrottle } from "./event-throttle.mjs";
+
+// Per-run live callback config, set at the start of handleRun.
+let callback = null; // { baseUrl, secret, runId }
+let heartbeatTimer = null;
+const outputThrottle = createThrottle(1000, () => Date.now(), new Set([
+  "clone.start", "clone.done", "agent.start", "agent.done", "tests", "push", "pr.opened", "agent.result",
+]));
+
+// Sign + POST a single event to the worker. Best-effort: failures never break the run.
+async function emit(eventType, message, severity = "info", metadata = {}) {
+  if (!callback?.baseUrl || !callback?.secret) return;
+  if (!outputThrottle(eventType)) return;
+  try {
+    const body = JSON.stringify({ eventType, message: String(message ?? "").slice(0, 2000), severity, metadata });
+    const timestamp = String(Date.now());
+    const signature = createHmac("sha256", callback.secret).update(`${timestamp}.${body}`).digest("hex");
+    await fetch(`${callback.baseUrl}/api/internal/runs/${callback.runId}/events`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-fly-timestamp": timestamp,
+        "x-fly-signature": signature,
+      },
+      body,
+    });
+  } catch {
+    // swallow — the final result blob is still authoritative
+  }
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => { void emit("heartbeat", "", "info"); }, 15_000);
+}
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
 
 const PORT = Number(process.env.PORT ?? 8080);
 // 250 turns can run long; keep the cap generous so the agent is never SIGKILLed
@@ -43,6 +82,7 @@ function tail(text, n = 3000) {
 // where a run is and how long each stage took.
 function step(runId, stage, extra = {}) {
   console.log(JSON.stringify({ t: new Date().toISOString(), runId, stage, ...extra }));
+  void emit(stage, extra.message ?? "", extra.severity ?? "info", extra);
 }
 
 function exec(cmd, args, opts = {}) {
@@ -469,6 +509,15 @@ async function handleAddressPr(job) {
 }
 
 async function handleRun(rawBody) {
+  try {
+    return await handleRunInner(rawBody);
+  } finally {
+    stopHeartbeat();
+    callback = null;
+  }
+}
+
+async function handleRunInner(rawBody) {
   let job;
   try {
     job = JSON.parse(rawBody);
@@ -478,6 +527,11 @@ async function handleRun(rawBody) {
   if (!job.runId || !job.objective || !job.repo?.owner || !job.repo?.repo || !job.githubToken) {
     return { ok: false, error: "missing_required_fields" };
   }
+
+  callback = job.callbackBaseUrl && job.callbackSecret
+    ? { baseUrl: job.callbackBaseUrl.replace(/\/$/, ""), secret: job.callbackSecret, runId: job.runId }
+    : null;
+  startHeartbeat();
 
   // Detected from the clone — never assume "main" (many repos default to master).
   let baseBranch = job.repo.baseBranch || "main";
