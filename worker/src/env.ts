@@ -17,6 +17,20 @@ export type RunWorkflowParams = {
   attempt?: number;
 };
 
+// Off-the-hot-path retain job. Consumed by the fly-dev-memory queue handler, which
+// calls the MemoryProvider and mirrors the result into the agent_memories D1 table.
+export type MemoryRetainMessage = {
+  kind: "retain";
+  runId: string;
+  userId: string;
+  projectId?: string | null;
+  bank: string;
+  content: string;
+  context: Record<string, unknown>;
+  tags?: string[];
+  ts: number;
+};
+
 // Repository coordinates resolved for a run (non-secret).
 export type RunRepoCoords = {
   owner: string;
@@ -58,6 +72,7 @@ export type Env = {
   ARTIFACTS: R2Bucket;
   TEMPLATE_ASSETS: R2Bucket;
   WORK_QUEUE: Queue<WorkQueueMessage>;
+  MEMORY_QUEUE: Queue<MemoryRetainMessage>;
   RUN_WORKFLOW: Workflow<RunWorkflowParams>;
   PROJECT_CONDUCTORS: DurableObjectNamespace;
   USER_WORKER_CONTROLLERS: DurableObjectNamespace;
@@ -103,6 +118,13 @@ export type Env = {
   CONTINUE_AUTONOMY?: string;
   CONTINUE_EXECUTE_CAP?: string;
   MAX_CONTAINER_INSTANCES?: string;
+  // Agent memory (self-hosted Hindsight). Inert unless MEMORY_ENABLED="true".
+  MEMORY_ENABLED?: string;
+  MEMORY_REFLECT_MODE?: string; // "auto" (default, rely on consolidation) | "cron"
+  HINDSIGHT_BASE_URL?: string; // e.g. https://hindsight.fly.pm
+  HINDSIGHT_API_KEY?: string; // secret — Hindsight tenant API key
+  HINDSIGHT_CF_ACCESS_CLIENT_ID?: string; // secret — CF Access service token
+  HINDSIGHT_CF_ACCESS_CLIENT_SECRET?: string; // secret
 };
 
 export type CurrentUser = {

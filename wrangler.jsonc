@@ -96,9 +96,22 @@
       {
         "binding": "WORK_QUEUE",
         "queue": "fly-dev-work"
+      },
+      {
+        "binding": "MEMORY_QUEUE",
+        "queue": "fly-dev-memory"
       }
     ],
     "consumers": [
+      {
+        // Agent-memory retains, off the run hot path. Generous retries because a
+        // brief Hindsight/VM blip should redeliver, not dead-letter, a memory.
+        "queue": "fly-dev-memory",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "fly-dev-memory-dlq"
+      },
       {
         "queue": "fly-dev-work",
         // Serialize queue ADMISSION (max_concurrency: 1) so getActiveRunCount()
@@ -184,6 +197,12 @@
     // containers at once (shared with ~6 other container apps), and gate=4 produced
     // capacity_exhausted churn. Set to 2 (real concurrency, minimal overshoot); the
     // bounded-requeue absorbs the rest. Raise only if 2 provisions cleanly with headroom.
-    "MAX_CONTAINER_INSTANCES": "2"
+    "MAX_CONTAINER_INSTANCES": "2",
+    // Agent memory (self-hosted Hindsight). Flip MEMORY_ENABLED to "true" to turn on
+    // recall/retain/reflect; secrets (HINDSIGHT_API_KEY, HINDSIGHT_CF_ACCESS_CLIENT_ID/
+    // SECRET) are set via `wrangler secret put`. Server lives in infra/hindsight/.
+    "MEMORY_ENABLED": "false",
+    "MEMORY_REFLECT_MODE": "auto",
+    "HINDSIGHT_BASE_URL": "https://hindsight.fly.pm"
   }
 }

@@ -614,7 +614,11 @@ async function handleRunInner(rawBody) {
 
     step(job.runId, "agent:start", { provider: job.agentProvider ?? "claude-code" });
     const agentStartedAt = Date.now();
-    const agent = await runAgent(job, repoDir, job.objective);
+    // Prepend recalled agent memory (best-effort; absent on older payloads).
+    const prompt = job.priorContext
+      ? `${job.priorContext}\n\n---\n\n# Task\n${job.objective}`
+      : job.objective;
+    const agent = await runAgent(job, repoDir, prompt);
     step(job.runId, "agent:done", { exitCode: agent.code, ms: Date.now() - agentStartedAt });
     const summary = (agent.stdout || "").slice(-4000);
     const logs = (agent.stderr || "").slice(-4000);
