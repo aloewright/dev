@@ -661,7 +661,10 @@ app.delete("/api/repos/:id", async (c) => {
   );
   if (!repo) return c.json({ error: "Repository not found" }, 404);
 
-  const token = await getDecryptedToken(c.env, user.id, "github");
+  // Prefer the classic PAT: the connected "github" account is a GitHub *App* token
+  // (user-to-server), which CANNOT delete repositories ("Resource not accessible by
+  // integration"). A classic personal access token with the delete_repo scope can.
+  const token = c.env.GITHUB_PAT || (await getDecryptedToken(c.env, user.id, "github"));
   if (!token) return c.json({ error: "GitHub connection required" }, 400);
 
   const result = await deleteRepository(token, repo.owner, repo.name);
@@ -672,11 +675,13 @@ app.delete("/api/repos/:id", async (c) => {
       await runSql(c.env, "DELETE FROM github_repos WHERE id = ? AND user_id = ?", [repoId, user.id]);
       return c.json({ ok: true, pruned: true });
     }
-    // 403: the OAuth token lacks the delete_repo scope (or admin rights on the repo).
-    // Tokens only carry scopes granted at authorization time — guide the user to reconnect.
+    // 403: the token can't delete this repo. GitHub Apps can't delete repos at all, and
+    // a PAT/OAuth token needs the delete_repo scope + admin on the repo.
     if (result.status === 403) {
       return c.json(
-        { error: `${result.error} — reconnect GitHub (Reconnect button) to grant the "delete_repo" permission.` },
+        {
+          error: `${result.error} — deleting a repo needs a classic GitHub personal access token with the "delete_repo" scope (set as GITHUB_PAT). The connected GitHub App can't delete repositories; otherwise delete it on github.com.`,
+        },
         403,
       );
     }
@@ -701,7 +706,8 @@ app.patch("/api/repos/:id", async (c) => {
   );
   if (!repo) return c.json({ error: "Repository not found" }, 404);
 
-  const token = await getDecryptedToken(c.env, user.id, "github");
+  // Prefer the classic PAT (GitHub App tokens lack repo-admin for rename in many setups).
+  const token = c.env.GITHUB_PAT || (await getDecryptedToken(c.env, user.id, "github"));
   if (!token) return c.json({ error: "GitHub connection required" }, 400);
 
   const result = await renameRepository(token, repo.owner, repo.name, newName);
