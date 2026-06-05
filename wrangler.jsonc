@@ -179,10 +179,12 @@
     "AUTH_HUB_URL": "https://auth.fly.pm",
     "CONTINUE_AUTONOMY": "true",
     "CONTINUE_EXECUTE_CAP": "3",
-    // Queue-admission gate. MUST match the account's REAL provisionable container
-    // concurrency, NOT the max_instances ceiling. Measured 2026-06-05: the platform
-    // only ever brings up ~1 standard-2 sandbox at a time; gating above that admits
-    // doomed workflows that spin through the requeue budget and die capacity_exhausted.
-    "MAX_CONTAINER_INSTANCES": "1"
+    // Queue-admission gate: how many sandboxes may run concurrently. Was pinned to 1
+    // as a band-aid during the orphaned-container crisis (8 zombies held every slot).
+    // With stop-on-completion + the reaper now reclaiming orphaned containers, raise it
+    // for real concurrency. Start at 4 (account shares container capacity with other
+    // apps); bounded-requeue safely absorbs any overshoot. Tune toward max_instances (8)
+    // if 4 provisions cleanly.
+    "MAX_CONTAINER_INSTANCES": "4"
   }
 }

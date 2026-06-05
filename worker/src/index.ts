@@ -1503,6 +1503,16 @@ async function reapStuckRuns(env: Env): Promise<void> {
     // message) are always eligible regardless of last_error.
     if (kind === "error" && !isRetryableError(run.last_error)) continue;
 
+    // The run's workflow is dead/stalled or it's being re-dispatched — stop any lingering
+    // container BEFORE a fresh attempt. Otherwise deploy/crash-orphaned containers (whose
+    // workflow was reset out from under them) pile up and occupy the few slots. Best-effort.
+    try {
+      const ns = env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
+      await getContainer(ns, `run-${run.id}`).stop();
+    } catch {
+      // no container / already stopped — ignore
+    }
+
     let meta: Record<string, unknown> = {};
     try {
       meta = JSON.parse(run.metadata_json) as Record<string, unknown>;
