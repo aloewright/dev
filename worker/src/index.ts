@@ -1219,7 +1219,18 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
 
     // Credentials are resolved and used inside this single step so they are
     // never returned from a step (never persisted in Workflow storage). See S6.
-    const result = await step.do("dispatch to agent", async (): Promise<ContainerRunResult> => {
+    //
+    // The container /run is a LONG (up to AGENT_TIMEOUT_MS = 90min agent + clone/test/
+    // push/PR) and NON-IDEMPOTENT call (re-running re-clones, re-runs the agent, and can
+    // open a DUPLICATE PR). The Workflows default step timeout is only 10 minutes with
+    // automatic retries — that was timing out mid-agent and re-running the whole pipeline
+    // (observed: 3x clone/agent cycles in one run -> agent_timeout, tripled Claude usage).
+    // Give it a timeout that covers the full agent budget and a single attempt; a genuine
+    // transient failure is recovered by the reaper re-queuing a FRESH run.
+    const result = await step.do("dispatch to agent", {
+      retries: { limit: 1, delay: "10 seconds", backoff: "constant" },
+      timeout: "110 minutes",
+    }, async (): Promise<ContainerRunResult> => {
       const creds = await prepareRunCredentials(this.env, plan);
       if (!creds.githubToken) {
         return { ok: false, error: "no_github_token" };
