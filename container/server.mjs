@@ -32,7 +32,7 @@ async function emit(rawEventType, message, severity = "info", metadata = {}) {
     const body = JSON.stringify({ eventType, message: String(message ?? "").slice(0, 2000), severity, metadata });
     const timestamp = String(Date.now());
     const signature = createHmac("sha256", callback.secret).update(`${timestamp}.${body}`).digest("hex");
-    await fetch(`${callback.baseUrl}/api/internal/runs/${callback.runId}/events`, {
+    const res = await fetch(`${callback.baseUrl}/api/internal/runs/${callback.runId}/events`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -41,8 +41,12 @@ async function emit(rawEventType, message, severity = "info", metadata = {}) {
       },
       body,
     });
-  } catch {
-    // swallow — the final result blob is still authoritative
+    if (!res.ok) {
+      console.error(`emit_status ${eventType}: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 120)}`);
+    }
+  } catch (err) {
+    // Best-effort: failures never break the run, but log so we can diagnose egress/TLS.
+    console.error(`emit_failed ${eventType} -> ${callback.baseUrl}: ${String(err?.cause ?? err)}`);
   }
 }
 
