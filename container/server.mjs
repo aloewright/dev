@@ -306,6 +306,7 @@ async function openPullRequest(job, head, base, title, body, draft, token) {
       "x-github-api-version": "2022-11-28",
     },
     body: JSON.stringify({ title, head, base, body, draft }),
+    signal: AbortSignal.timeout(30000),
   });
   if (!res.ok) {
     return { ok: false, status: res.status, text: (await res.text()).slice(0, 500) };
@@ -348,6 +349,7 @@ function ghApi(job, token, suffix, init = {}) {
       "x-github-api-version": "2022-11-28",
       ...(init.headers || {}),
     },
+    signal: init.signal ?? AbortSignal.timeout(30000),
   });
 }
 
@@ -701,7 +703,6 @@ async function handleRunInner(rawBody) {
         error: "pr_failed",
         branch,
         commitSha,
-        diff,
         summary,
         logs: `PR create HTTP ${pr.status}: ${pr.text}`,
         testsRun: gate.ran,
@@ -725,7 +726,6 @@ async function handleRunInner(rawBody) {
       mergeReason: merge.reason ?? null,
       branch,
       commitSha,
-      diff,
       summary,
       logs,
       testsRun: gate.ran,
@@ -745,6 +745,7 @@ async function handleRunInner(rawBody) {
 // and orphaning a slot. It also self-heals deploy orphans: if a `wrangler deploy`
 // resets the RunWorkflow DO mid-run, this container still exits when its /run ends.
 let runInFlight = false;
+let everReceivedRun = false;
 
 function scheduleExit() {
   try {
@@ -752,9 +753,11 @@ function scheduleExit() {
   } catch {
     /* already closing */
   }
-  // Grace window: let the Container DO finish relaying the /run response body back to
-  // the Worker, and any final emit() callback flush, before the process dies.
-  setTimeout(() => process.exit(0), 2500);
+  // Generous grace: the Container DO relays the /run response body back to the Worker
+  // LAZILY (it streams), so exiting before the Worker consumes it truncates the response
+  // and spuriously fails the run. A small body (we drop the large diff below) relays well
+  // within this window.
+  setTimeout(() => process.exit(0), 8000);
 }
 
 const server = http.createServer(async (request, response) => {
@@ -763,11 +766,23 @@ const server = http.createServer(async (request, response) => {
   }
   if (request.method === "POST" && request.url === "/run") {
     runInFlight = true;
-    // Self-exit AFTER the response is fully flushed (covers success, no_changes,
-    // exception, and address_pr — all return through this single sendJson).
-    response.on("finish", () => {
+    everReceivedRun = true;
+    // Hard max-life backstop: NOTHING (a hung GitHub fetch, a wedged child, a stalled
+    // body) may keep the container alive past the agent's own ceiling. Exit even if /run
+    // never returns. The still-firing 15s heartbeat would otherwise make the worker reaper
+    // think the run is healthy forever.
+    const maxLife = setTimeout(() => process.exit(1), AGENT_TIMEOUT_MS + 10 * 60 * 1000);
+    if (typeof maxLife.unref === "function") maxLife.unref();
+    const onEnd = () => {
       runInFlight = false;
       scheduleExit();
+    };
+    // 'finish' = response fully flushed (normal). 'close' WITHOUT finish = the socket was
+    // aborted (client/DO went away, e.g. the dispatch step's 110-min timeout) — still
+    // self-exit so runInFlight never wedges true (which would also make SIGTERM a no-op).
+    response.on("finish", onEnd);
+    response.on("close", () => {
+      if (!response.writableFinished) onEnd();
     });
     try {
       const body = await readBody(request);
@@ -787,10 +802,25 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, "0.0.0.0");
 
-// Node runs as PID 1 here (exec-form CMD), which has NO default signal handling —
-// without these, a worker-initiated stop() (SIGTERM) is silently ignored and the
-// instance lingers. Drain gracefully: exit now if idle; if a run is in flight, let
-// the /run `finish` self-exit handle it (never SIGTERM-kill the agent mid-run).
+// Boot-deadline: if no /run EVER arrives (the RunWorkflow DO was reset between
+// markRunReady and the dispatch fetch — every deploy hits this, plus the
+// no_github_token early-return), the container would otherwise idle for sleepAfter
+// (120m). Exit after a short window instead. Well below the 90m agent budget, and a
+// real run sets everReceivedRun before this fires.
+const bootDeadline = setTimeout(() => {
+  if (!everReceivedRun) {
+    try {
+      server.close();
+    } catch {
+      /* ignore */
+    }
+    process.exit(0);
+  }
+}, 12 * 60 * 1000);
+if (typeof bootDeadline.unref === "function") bootDeadline.unref();
+
+// Node runs as PID 1 (exec-form CMD) — no default signal handling. Drain gracefully:
+// exit if idle; if a run is in flight, the response finish/close self-exit handles it.
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
     if (!runInFlight) scheduleExit();

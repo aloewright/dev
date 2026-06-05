@@ -724,27 +724,37 @@ app.patch("/api/repos/:id", async (c) => {
 
 // Maintenance: force-stop sandbox containers that outlived their run (orphaned/idle
 // instances occupying the few container slots). Auth: the signed-in @fly.pm user.
-// Body: { runIds: string[] }. Stops the container for each `run-<runId>` sandbox.
+// A run with no heartbeat for this long is "stalled". Mirrors the reaper's
+// `datetime('now','-8 minutes')` stall predicate so the maintenance guard and the
+// reaper never disagree about whether a run is healthy.
+const RUN_STALL_MS = 8 * 60_000;
+
+// Body: { runIds: string[], force?: boolean }. Destroys the container for each
+// `run-<runId>`. `force` bypasses the active-run guard (escape hatch for a run that
+// is wedged but still heartbeating — e.g. a hung GitHub call).
 app.post("/api/maintenance/stop-containers", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
-  const body = (await c.req.json().catch(() => ({}))) as { runIds?: string[] };
+  const body = (await c.req.json().catch(() => ({}))) as { runIds?: string[]; force?: boolean };
   const runIds = Array.isArray(body.runIds) ? body.runIds.slice(0, 50) : [];
+  const force = body.force === true;
   const ns = c.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
   const results: Array<{ runId: string; ok: boolean; error?: string }> = [];
   for (const runId of runIds) {
-    // Safety: never hard-kill a genuinely-active run's container. Only orphans
-    // (terminal/queued in D1, or stale-heartbeat) are eligible.
-    const run = await first<{ status: string; last_heartbeat_at: string | null }>(
+    // Safety: never hard-kill a genuinely-active run's container unless force=true.
+    // "Active" matches the reaper's stall threshold (RUN_STALL_MS, 8min) so the two
+    // never disagree, with started_at as a fallback for a slow-booting `starting` run.
+    const run = await first<{ status: string; last_heartbeat_at: string | null; started_at: string | null }>(
       c.env,
-      "SELECT status, last_heartbeat_at FROM runs WHERE id = ?",
+      "SELECT status, last_heartbeat_at, started_at FROM runs WHERE id = ?",
       [runId],
     );
-    const hb = run?.last_heartbeat_at ? Date.parse(`${run.last_heartbeat_at.replace(" ", "T")}Z`) : 0;
+    const ts = run?.last_heartbeat_at ?? run?.started_at ?? null;
+    const hb = ts ? Date.parse(`${ts.replace(" ", "T")}Z`) : 0;
     const activeHealthy =
-      run && (run.status === "running" || run.status === "starting") && hb > Date.now() - 120_000;
-    if (activeHealthy) {
-      results.push({ runId, ok: false, error: "skipped: run is active and heartbeating" });
+      run && (run.status === "running" || run.status === "starting") && hb > Date.now() - RUN_STALL_MS;
+    if (activeHealthy && !force) {
+      results.push({ runId, ok: false, error: "skipped: run active within stall window (use force to override)" });
       continue;
     }
     // destroy() (SIGKILL) is reliable; stop() (SIGTERM) is a no-op on a process that

@@ -179,12 +179,11 @@
     "AUTH_HUB_URL": "https://auth.fly.pm",
     "CONTINUE_AUTONOMY": "true",
     "CONTINUE_EXECUTE_CAP": "3",
-    // Queue-admission gate: how many sandboxes may run concurrently. Was pinned to 1
-    // as a band-aid during the orphaned-container crisis (8 zombies held every slot).
-    // With stop-on-completion + the reaper now reclaiming orphaned containers, raise it
-    // for real concurrency. Start at 4 (account shares container capacity with other
-    // apps); bounded-requeue safely absorbs any overshoot. Tune toward max_instances (8)
-    // if 4 provisions cleanly.
-    "MAX_CONTAINER_INSTANCES": "4"
+    // Queue-admission gate: how many sandboxes may run concurrently. Measured: with
+    // self-exit + orphans cleared, the account still provisions only ~1-2 standard-3
+    // containers at once (shared with ~6 other container apps), and gate=4 produced
+    // capacity_exhausted churn. Set to 2 (real concurrency, minimal overshoot); the
+    // bounded-requeue absorbs the rest. Raise only if 2 provisions cleanly with headroom.
+    "MAX_CONTAINER_INSTANCES": "2"
   }
 }
