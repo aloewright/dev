@@ -48,7 +48,8 @@ import {
   createTemplateApp,
   markRunCompleted,
   markRunFailed,
-  markRunStarted,
+  markRunStarting,
+  markRunReady,
   prepareRunCredentials,
   resolveRunPlan,
   startRunWorkflow,
@@ -987,6 +988,8 @@ export class SandboxContainer extends Container<Env> {
     "files.pythonhosted.org",
     "proxy.golang.org",
     "sum.golang.org",
+    // Worker origin for the live-event callback (POST /api/internal/runs/:id/events).
+    "dev.fly.pm",
   ];
   pingEndpoint = "localhost:8080/ready";
 }
@@ -1000,7 +1003,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
 
     const sandboxId = await step.do("reserve sandbox", async () => {
       const sandboxIdValue = `run-${payload.runId}`;
-      await markRunStarted(this.env, payload.runId, sandboxIdValue);
+      await markRunStarting(this.env, payload.runId, sandboxIdValue);
       return sandboxIdValue;
     });
 
@@ -1024,11 +1027,17 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
     await step.do("start sandbox container", async () => {
       const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
       const container = getContainer(containerNamespace, sandboxId);
-      await container.startAndWaitForPorts([8080], {
-        instanceGetTimeoutMS: 30_000,
-        portReadyTimeoutMS: 60_000,
-        waitInterval: 1_000,
-      });
+      try {
+        await container.startAndWaitForPorts([8080], {
+          instanceGetTimeoutMS: 30_000,
+          portReadyTimeoutMS: 60_000,
+          waitInterval: 1_000,
+        });
+      } catch (error) {
+        await markRunFailed(this.env, payload.runId, new Error(`container_start_failed: ${String(error)}`));
+        throw error;
+      }
+      await markRunReady(this.env, payload.runId);
     });
 
     // Credentials are resolved and used inside this single step so they are
@@ -1056,6 +1065,8 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
             linearToken: creds.linearToken,
             aiGateway: creds.aiGateway,
             claudeOauthToken: creds.claudeOauthToken,
+            callbackBaseUrl: this.env.APP_URL,
+            callbackSecret: this.env.INTERNAL_API_SECRET ?? "",
           }),
         }),
       );
