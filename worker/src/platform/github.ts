@@ -173,7 +173,7 @@ export async function deleteRepository(
   token: string,
   owner: string,
   repo: string,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; status?: number; error?: string }> {
   const headers = ghHeaders(token);
   const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
     method: "DELETE",
@@ -181,11 +181,13 @@ export async function deleteRepository(
   });
 
   if (response.ok || response.status === 204) {
-    return { ok: true };
+    return { ok: true, status: response.status };
   }
 
+  // Surface the status so the caller can distinguish "already gone" (404 — prune the
+  // stale local cache row) from "missing delete_repo scope / not an admin" (403).
   const body = (await response.json().catch(() => ({}))) as { message?: string };
-  return { ok: false, error: body.message ?? `HTTP ${response.status}` };
+  return { ok: false, status: response.status, error: body.message ?? `HTTP ${response.status}` };
 }
 
 export async function renameRepository(

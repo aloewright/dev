@@ -665,7 +665,23 @@ app.delete("/api/repos/:id", async (c) => {
   if (!token) return c.json({ error: "GitHub connection required" }, 400);
 
   const result = await deleteRepository(token, repo.owner, repo.name);
-  if (!result.ok) return c.json({ error: result.error }, 500);
+  if (!result.ok) {
+    // The repo is already gone on GitHub (renamed/deleted elsewhere) — the local cache
+    // row is stale. "Deleting" it should just prune the stale row, not error forever.
+    if (result.status === 404) {
+      await runSql(c.env, "DELETE FROM github_repos WHERE id = ? AND user_id = ?", [repoId, user.id]);
+      return c.json({ ok: true, pruned: true });
+    }
+    // 403: the OAuth token lacks the delete_repo scope (or admin rights on the repo).
+    // Tokens only carry scopes granted at authorization time — guide the user to reconnect.
+    if (result.status === 403) {
+      return c.json(
+        { error: `${result.error} — reconnect GitHub (Reconnect button) to grant the "delete_repo" permission.` },
+        403,
+      );
+    }
+    return c.json({ error: result.error }, 500);
+  }
 
   await runSql(c.env, "DELETE FROM github_repos WHERE id = ? AND user_id = ?", [repoId, user.id]);
   return c.json({ ok: true });
