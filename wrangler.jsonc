@@ -95,7 +95,13 @@
     "consumers": [
       {
         "queue": "fly-dev-work",
-        "max_batch_size": 10,
+        // Serialize queue ADMISSION (max_concurrency: 1) so getActiveRunCount()
+        // can't be read stale by parallel autoscaled consumer invocations racing
+        // the count-then-create capacity gate. Throughput ceiling is 8 containers
+        // anyway, so a single admission consumer is acceptable. Combined with the
+        // per-batch reservation in queue(), this closes the cross-invocation race.
+        "max_concurrency": 1,
+        "max_batch_size": 8,
         "max_batch_timeout": 5,
         "max_retries": 3,
         "dead_letter_queue": "fly-dev-work-dlq"

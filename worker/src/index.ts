@@ -1267,13 +1267,19 @@ export default {
   async queue(batch: MessageBatch<WorkQueueMessage>, env: Env): Promise<void> {
     const maxInstances = Number.parseInt(env.MAX_CONTAINER_INSTANCES ?? "8", 10);
 
+    // Read the live active-run count ONCE per batch, then reserve slots locally as we
+    // admit each start-run. With max_concurrency:1 (wrangler.jsonc) the queue runs one
+    // consumer invocation at a time, so a single read-then-reserve loop is the whole
+    // admission gate — no two invocations can both read a stale count and over-admit.
+    const baseActive = await getActiveRunCount(env);
+    let reservedThisBatch = 0;
+
     for (const message of batch.messages) {
       try {
         if (message.body.action === "start-run") {
-          // Check for open instances before releasing the execution.
-          const runningCount = await getActiveRunCount(env);
-          if (runningCount >= maxInstances) {
-            // No open instances: retry later.
+          // Gate on the count we read once plus what we've already reserved in this
+          // batch. No free slot → retry later (the message redelivers).
+          if (baseActive + reservedThisBatch >= maxInstances) {
             message.retry();
             continue;
           }
@@ -1283,6 +1289,9 @@ export default {
             "SELECT objective FROM runs WHERE id = ?",
             [message.body.runId],
           );
+          // Reserve the slot BEFORE dispatching so a throw mid-dispatch doesn't let the
+          // next message in this batch reuse the slot we were about to consume.
+          reservedThisBatch++;
           await startRunWorkflow(env, {
             runId: message.body.runId,
             userId: message.body.userId,
