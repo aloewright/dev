@@ -555,6 +555,63 @@ app.get("/api/runs/:id/events", async (c) => {
   return c.json({ events });
 });
 
+// Server-sent events: live run event stream for the Command Center. Polls D1 by
+// id-cursor and pushes new rows; closes on terminal status or after a max lifetime.
+app.get("/api/runs/:id/events/stream", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const runId = c.req.param("id");
+  const owned = await first<{ id: string }>(
+    c.env,
+    "SELECT id FROM runs WHERE id = ? AND user_id = ?",
+    [runId, user.id],
+  );
+  if (!owned) return c.json({ error: "Run not found" }, 404);
+
+  const env = c.env;
+  const encoder = new TextEncoder();
+  const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+  const MAX_LIFETIME_MS = 15 * 60 * 1000;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: unknown) =>
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      let cursor = 0;
+      let lastStatus = "";
+      const startedAt = Date.now();
+      send("open", { runId });
+      while (Date.now() - startedAt < MAX_LIFETIME_MS) {
+        const rows = await all<{ id: number; eventType: string; message: string; severity: string; metadataJson: string; createdAt: string }>(
+          env,
+          `SELECT id, event_type AS eventType, message, severity, metadata_json AS metadataJson, created_at AS createdAt
+             FROM run_events WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT 200`,
+          [runId, cursor],
+        );
+        for (const row of rows) {
+          cursor = row.id;
+          send("run_event", row);
+        }
+        const statusRow = await first<{ status: string }>(env, "SELECT status FROM runs WHERE id = ?", [runId]);
+        if (statusRow && statusRow.status !== lastStatus) {
+          lastStatus = statusRow.status;
+          send("status", { status: lastStatus });
+        }
+        if (statusRow && TERMINAL.has(statusRow.status)) {
+          send("done", { status: statusRow.status });
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
+  });
+});
+
 app.post("/api/tasks", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
