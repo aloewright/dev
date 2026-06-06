@@ -74,17 +74,9 @@ services:
       HINDSIGHT_API_LOG_LEVEL: info
     networks: [hindsight-net]
 
-  # Static perf-dashboard (vectorize-io/hindsight-continuous-performance-monitor).
-  # Files synced to /opt/hindsight-monitor/site on the host. Served through the same
-  # cloudflared tunnel at hindsight-monitor.fly.pm, gated by Cloudflare Access.
-  monitor:
-    image: nginx:alpine
-    restart: unless-stopped
-    volumes:
-      - /opt/hindsight-monitor/site:/usr/share/nginx/html:ro
-    ports:
-      - "127.0.0.1:8080:80" # loopback only; reached via cloudflared
-    networks: [hindsight-net]
+  # (Removed) The static perf-dashboard nginx container was superseded by the
+  # hindsight-monitor Cloudflare Worker (infra/hindsight-monitor/), which serves a
+  # live dark-mode dashboard of THIS instance's stats at hindsight-monitor.fly.pm.
 
 networks:
   hindsight-net:
