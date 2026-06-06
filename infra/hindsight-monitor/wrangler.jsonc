@@ -1,0 +1,14 @@
+{
+  "name": "hindsight-monitor",
+  "main": "src/index.js",
+  "compatibility_date": "2026-05-01",
+  "observability": { "enabled": true },
+  "workers_dev": false,
+  "routes": [{ "pattern": "hindsight-monitor.fly.pm", "custom_domain": true }],
+  "vars": {
+    "HINDSIGHT_BASE_URL": "https://hindsight.fly.pm"
+  }
+  // Secrets (wrangler secret put): HINDSIGHT_API_KEY,
+  // HINDSIGHT_CF_ACCESS_CLIENT_ID, HINDSIGHT_CF_ACCESS_CLIENT_SECRET.
+  // Custom domain hindsight-monitor.fly.pm is attached after first deploy.
+}
