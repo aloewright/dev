@@ -237,20 +237,32 @@ function writeGitExclude(repoDir) {
 // test:null when a recognized type has no usable test harness.
 function detectTestPlan(repoDir) {
   if (existsSync(path.join(repoDir, "package.json"))) {
-    let scripts = {};
+    let pkg = {};
     try {
-      scripts = JSON.parse(readFileSync(path.join(repoDir, "package.json"), "utf8")).scripts ?? {};
+      pkg = JSON.parse(readFileSync(path.join(repoDir, "package.json"), "utf8"));
     } catch {
-      scripts = {};
+      pkg = {};
     }
+    const scripts = pkg.scripts ?? {};
+    // Pick the package manager from the lockfile / packageManager field so a pnpm
+    // or yarn (mono)repo isn't run with npm (which fails on the wrong lockfile and
+    // sends the agent into a pointless fix loop). pnpm/yarn run via corepack shims
+    // enabled in the image. install uses non-frozen so a slightly stale lockfile
+    // doesn't hard-fail the gate.
+    const pm = String(pkg.packageManager ?? "");
+    let manager = "npm";
+    if (pm.startsWith("pnpm") || existsSync(path.join(repoDir, "pnpm-lock.yaml"))) manager = "pnpm";
+    else if (pm.startsWith("yarn") || existsSync(path.join(repoDir, "yarn.lock"))) manager = "yarn";
+
     if (!scripts.test) {
       return { projectType: "nodejs", install: null, test: null, reason: "no test script in package.json" };
     }
-    return {
-      projectType: "nodejs",
-      install: ["npm", ["install", "--no-audit", "--no-fund"]],
-      test: ["npm", ["test"]],
-    };
+    const install = {
+      pnpm: ["pnpm", ["install", "--no-frozen-lockfile"]],
+      yarn: ["yarn", ["install"]],
+      npm: ["npm", ["install", "--no-audit", "--no-fund"]],
+    }[manager];
+    return { projectType: `nodejs/${manager}`, install, test: [manager, ["test"]] };
   }
   if (existsSync(path.join(repoDir, "go.mod"))) {
     return { projectType: "go", install: ["go", ["mod", "download"]], test: ["go", ["test", "./..."]] };
