@@ -53,11 +53,8 @@ export function RootLayout() {
             />
           ))}
           <Box style={{ marginTop: "auto" }} pt="md">
-            <Text size="xs" c="dimmed" truncate>
-              {overview?.user ? `${overview.user.flyUserSlug}` : "Checking session"}
-            </Text>
             <Text size="xs" c="dimmed" truncate mb="xs">
-              {overview?.user?.authSource ?? ""}
+              {overview?.user ? (overview.user.name || overview.user.email || "Signed in") : "Checking session"}
             </Text>
             <Button size="xs" variant="default" fullWidth mb={6} loading={overviewQuery.isFetching} onClick={() => void queryClient.invalidateQueries({ queryKey: ["overview"] })}>
               Refresh
