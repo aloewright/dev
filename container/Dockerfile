@@ -4,6 +4,12 @@ FROM node:22-slim
 ENV NODE_ENV=production
 ENV PORT=8080
 
+# Enable corepack so the test gate can run pnpm/yarn repos with the right package
+# manager (it reads each repo's `packageManager` field / lockfile). Without this a
+# pnpm monorepo gets run with npm, which always fails the gate.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable
+
 # Toolchains for the test gate: git + TLS roots (clone), python3/pip, Go
 # (installed below), and a C/C++ toolchain (build-essential + python3-dev) so
 # native deps build — node-gyp modules, Python C extensions, cgo. node:22-slim
