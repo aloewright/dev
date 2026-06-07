@@ -1,10 +1,12 @@
 /* AGPL-3.0-or-later */
 import { FormEvent, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Alert, Anchor, Badge, Button, Card, Group, Select, Stack, Text, Textarea, Title } from "@mantine/core";
 import { Link } from "@tanstack/react-router";
 import { fetchJson } from "@/lib/api";
 import type { Project } from "@/types";
+
+type Workflow = { id: string; name: string; template: string };
 
 type GoalResult = {
   goalId: string;
@@ -18,6 +20,8 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
   const queryClient = useQueryClient();
   const [objective, setObjective] = useState("");
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => fetchJson<{ workflows: Workflow[] }>("/api/workflows") });
+  const workflows = workflowsQuery.data?.workflows ?? [];
 
   const selectedProject =
     projects.find((project) => project.id === selectedProjectId) ?? projects[0];
@@ -78,6 +82,20 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
                 ? `Target repo: ${selectedProject.repoUrl}`
                 : "This project has no GitHub repo mapped. Map one in Linear Projects below before running a goal."}
             </Text>
+          ) : null}
+          {workflows.length > 0 ? (
+            <Select
+              label="Start from a workflow (optional)"
+              placeholder="Pick a template…"
+              clearable
+              searchable
+              data={workflows.map((w) => ({ value: w.id, label: w.name }))}
+              onChange={(value) => {
+                const wf = workflows.find((w) => w.id === value);
+                if (wf) setObjective(wf.template);
+              }}
+              comboboxProps={{ withinPortal: true }}
+            />
           ) : null}
           <Textarea
             label="Goal"
