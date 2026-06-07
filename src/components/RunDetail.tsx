@@ -57,7 +57,8 @@ export function RunDetail({ run }: { run: RecentRun }) {
     queryFn: () => fetchJson<{ events: RunEvent[] }>(`/api/runs/${run.id}/events`),
     refetchInterval: live ? 4000 : false,
   });
-  const events = eventsQuery.data?.events ?? [];
+  // Heartbeats are liveness pings, not run progress — drop them from the timeline.
+  const events = (eventsQuery.data?.events ?? []).filter((e) => e.eventType !== "heartbeat");
   const prUrl = events.map((e) => metaSummary(e.metadataJson).prUrl).find(Boolean);
 
   const waiting = run.status === "waiting_approval";
