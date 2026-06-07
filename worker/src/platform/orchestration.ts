@@ -14,6 +14,9 @@ export type CreateTaskPayload = {
   repoMappingId?: string;
   repoOwner?: string;
   repoName?: string;
+  // Groups runs created from one decomposed goal (see goal.ts). Stored in
+  // metadata_json so runs can be queried back per goal without a hot-path column.
+  goalId?: string;
   agentProvider?: "codex" | "claude-code";
   autonomyMode?: "manual_approval" | "auto_review" | "auto_eligible";
   source?: string;
@@ -78,6 +81,7 @@ export async function createTaskRun(env: Env, user: CurrentUser, payload: Create
       payload.linearTeamId ?? null,
       JSON.stringify({
         source: payload.source ?? "dev.fly.pm",
+        goalId: payload.goalId ?? null,
         mode: payload.mode ?? null,
         prNumber: payload.prNumber ?? null,
         linearIssueId: payload.linearIssueId ?? null,
@@ -410,6 +414,7 @@ export async function prepareRunCredentials(
   githubTokens: string[];
   linearToken: string | null;
   aiGateway: { url: string; token: string } | null;
+  gemmaFallback: { url: string; token: string; model: string } | null;
   claudeOauthToken: string | null;
 }> {
   const oauthToken = await getDecryptedToken(env, plan.userId, "github");
@@ -449,7 +454,20 @@ export async function prepareRunCredentials(
   // — the gateway only proxies API-key auth, not OAuth/subscription auth.
   const claudeOauthToken = env.CLAUDE_CODE_OAUTH_TOKEN ?? null;
 
-  return { githubToken, githubTokens, linearToken, aiGateway, claudeOauthToken };
+  // Failover agent: when claude-code hits its subscription usage limit, the
+  // container re-runs the job through the AI Gateway's OpenAI-compatible endpoint
+  // using Gemma (a Workers AI model that's always available and gateway-routed).
+  // base = .../compat; the OpenAI client appends /chat/completions.
+  const gemmaFallback =
+    env.CF_AIG_TOKEN && env.CLOUDFLARE_ACCOUNT_ID
+      ? {
+          url: `https://gateway.ai.cloudflare.com/v1/${env.CLOUDFLARE_ACCOUNT_ID}/${env.AI_GATEWAY_ID || "x"}/compat`,
+          token: env.CF_AIG_TOKEN,
+          model: "@cf/google/gemma-4-26b-a4b-it",
+        }
+      : null;
+
+  return { githubToken, githubTokens, linearToken, aiGateway, gemmaFallback, claudeOauthToken };
 }
 
 async function resolveRepoCoords(

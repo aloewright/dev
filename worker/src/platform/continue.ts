@@ -144,7 +144,7 @@ export async function continueProject(env: Env, user: CurrentUser, projectId: st
   } satisfies ContinueResult);
 }
 
-async function activeRepo(env: Env, projectId: string): Promise<{ owner: string; repo: string } | null> {
+export async function activeRepo(env: Env, projectId: string): Promise<{ owner: string; repo: string } | null> {
   return first<{ owner: string; repo: string }>(
     env,
     "SELECT owner, repo FROM repository_mappings WHERE linear_project_id = ? AND status = 'active' ORDER BY confidence DESC LIMIT 1",
@@ -152,7 +152,7 @@ async function activeRepo(env: Env, projectId: string): Promise<{ owner: string;
   );
 }
 
-function executeCap(env: Env): number {
+export function executeCap(env: Env): number {
   const n = Number.parseInt(env.CONTINUE_EXECUTE_CAP ?? "", 10);
   const cap = Number.isInteger(n) && n > 0 ? n : DEFAULT_EXECUTE_CAP;
   return Math.min(cap, MAX_EXECUTE_CAP);

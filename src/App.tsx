@@ -10,6 +10,7 @@ import { GoalIntakeCard } from "@/components/GoalIntakeCard";
 import { ProjectsCard } from "@/components/ProjectsCard";
 import { ReposCard } from "@/components/ReposCard";
 import { ConnectionsCard } from "@/components/ConnectionsCard";
+import { GoalsCard } from "@/components/GoalsCard";
 import { RecentRunsCard } from "@/components/RecentRunsCard";
 import { QueueCard, TemplatesCard, ArtifactsCard } from "@/components/SidePanels";
 import type { Overview } from "@/types";
@@ -114,6 +115,7 @@ export function App() {
 
             <Stack gap="lg">
               <ConnectionsCard connections={overview.connections} />
+              <GoalsCard />
               <RecentRunsCard runs={overview.recentRuns} />
               <QueueCard queue={overview.queue} />
               <TemplatesCard templates={overview.templates} />

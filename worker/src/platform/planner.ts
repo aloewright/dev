@@ -32,6 +32,27 @@ const PLANNER_SYSTEM =
   "issues that should begin immediately. Do not duplicate work already covered by an open issue.";
 
 export async function planNextSteps(env: Env, ctx: ProjectContext): Promise<NextStepPlan | null> {
+  return runPlanner(env, PLANNER_SYSTEM, buildPlannerPrompt(ctx));
+}
+
+const GOAL_SYSTEM =
+  "You are a senior engineering lead. Break the user's GOAL into a concrete, ordered " +
+  "set of self-contained engineering tasks that an autonomous coding agent can each " +
+  "implement and open a PR for, against the given repository. Respond with ONLY a JSON " +
+  'object, no prose, of the form {"summary": string, "issues": [{"title": string, ' +
+  '"description": string, "priority": 1-4}], "execute": number[]}. priority: ' +
+  "1=urgent,2=high,3=medium,4=low. issues: max 6, each a single PR-sized task with " +
+  "enough detail (files/areas, acceptance criteria) for an agent to act without further " +
+  "questions. execute: indexes of issues to start immediately (default: all of them). " +
+  "Do not duplicate work already covered by an existing open issue.";
+
+// Decompose a free-text GOAL (not a project's standing state) into issues. Used by
+// the goal-intake pipeline; reuses the same JSON contract as planNextSteps.
+export async function planGoal(env: Env, ctx: ProjectContext, goal: string): Promise<NextStepPlan | null> {
+  return runPlanner(env, GOAL_SYSTEM, buildGoalPrompt(ctx, goal));
+}
+
+async function runPlanner(env: Env, system: string, userPrompt: string): Promise<NextStepPlan | null> {
   const gatewayId = env.AI_GATEWAY_ID || "x";
   let raw: unknown;
   try {
@@ -43,8 +64,8 @@ export async function planNextSteps(env: Env, ctx: ProjectContext): Promise<Next
       PLANNER_MODEL,
       {
         messages: [
-          { role: "system", content: PLANNER_SYSTEM },
-          { role: "user", content: buildPlannerPrompt(ctx) },
+          { role: "system", content: system },
+          { role: "user", content: userPrompt },
         ],
         max_tokens: PLANNER_MAX_TOKENS,
       },
@@ -56,6 +77,22 @@ export async function planNextSteps(env: Env, ctx: ProjectContext): Promise<Next
     return null;
   }
   return extractJsonPlan(readContent(raw));
+}
+
+function buildGoalPrompt(ctx: ProjectContext, goal: string): string {
+  const issues = ctx.openIssues.length
+    ? ctx.openIssues.map((i) => `- [${i.identifier}] ${i.title} (${i.state})`).join("\n")
+    : "(none)";
+  return [
+    `GOAL:\n${goal}`,
+    "",
+    `Repository: ${ctx.repo ?? "(unmapped)"}`,
+    `Project: ${ctx.name}`,
+    `Project summary: ${ctx.summary || "(none)"}`,
+    `Existing open issues (avoid duplicating):\n${issues}`,
+    "",
+    "Produce the JSON plan that accomplishes the GOAL now.",
+  ].join("\n");
 }
 
 function buildPlannerPrompt(ctx: ProjectContext): string {
