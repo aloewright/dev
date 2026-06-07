@@ -69,6 +69,7 @@ import { continueProject } from "./platform/continue";
 import { runGoal, listGoals } from "./platform/goal";
 import { getCore, getCoreResponse, saveCore, buildCorePreamble } from "./platform/core";
 import { listWorkflows, saveWorkflow, deleteWorkflow } from "./platform/workflows";
+import { ingestKnowledge } from "./platform/knowledge";
 import {
   isRetryableError,
   isCapacityError,
@@ -704,6 +705,16 @@ app.delete("/api/workflows/:id", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
   return deleteWorkflow(c.env, user, c.req.param("id"));
+});
+
+// Knowledge base: upload a file (pdf/md/txt/png/jpg) → extract text → retain into
+// a Hindsight memory bank (global or a specific project).
+app.post("/api/knowledge", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const form = await c.req.formData().catch(() => null);
+  if (!form) return c.json({ error: "Expected multipart form data" }, 400);
+  return ingestKnowledge(c.env, user, form);
 });
 
 app.post("/api/runs/:id/approve", async (c) => {

@@ -28,7 +28,8 @@
     "drizzle-orm": "^0.45.2",
     "hono": "^4.12.23",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "unpdf": "^1.6.2"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.16.9",
