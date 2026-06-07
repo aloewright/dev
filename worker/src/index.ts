@@ -66,6 +66,7 @@ import {
 import { writeBackToLinear } from "./platform/linear";
 import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/github";
 import { continueProject } from "./platform/continue";
+import { runGoal, listGoals } from "./platform/goal";
 import {
   isRetryableError,
   isCapacityError,
@@ -648,6 +649,24 @@ app.post("/api/tasks", async (c) => {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
   return createTaskRun(c.env, user, payload as CreateTaskPayload);
+});
+
+// Goal intake: decompose an objective into Linear issues under the chosen project
+// and dispatch a run per issue. This is the primary "actionable portal" entrypoint.
+app.post("/api/goals", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const payload = await c.req.json().catch(() => null);
+  if (!payload || typeof payload !== "object") {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  return runGoal(c.env, user, payload as { objective?: string; linearProjectId?: string });
+});
+
+app.get("/api/goals", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return listGoals(c.env, user);
 });
 
 app.post("/api/runs/:id/approve", async (c) => {
@@ -1362,6 +1381,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
             githubTokens: creds.githubTokens,
             linearToken: creds.linearToken,
             aiGateway: creds.aiGateway,
+            gemmaFallback: creds.gemmaFallback,
             claudeOauthToken: creds.claudeOauthToken,
             callbackBaseUrl: this.env.APP_URL,
             callbackSecret: this.env.INTERNAL_API_SECRET ?? "",

@@ -1,10 +1,18 @@
 /* AGPL-3.0-or-later */
 import { FormEvent, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Alert, Badge, Button, Card, Group, Select, Stack, Text, Textarea, Title } from "@mantine/core";
+import { Alert, Anchor, Badge, Button, Card, Group, Select, Stack, Text, Textarea, Title } from "@mantine/core";
 import { Link } from "@tanstack/react-router";
 import { fetchJson } from "@/lib/api";
-import type { Project, TaskResponse } from "@/types";
+import type { Project } from "@/types";
+
+type GoalResult = {
+  goalId: string;
+  summary: string;
+  createdIssues: Array<{ id: string; identifier: string; url: string; title: string }>;
+  queuedRuns: Array<{ id: string; issue: string }>;
+  skipped: number;
+};
 
 export function GoalIntakeCard({ projects }: { projects: Project[] }) {
   const queryClient = useQueryClient();
@@ -13,10 +21,14 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
 
   const selectedProject =
     projects.find((project) => project.id === selectedProjectId) ?? projects[0];
+  // A goal can only execute against a project that has a GitHub repo mapped — that
+  // mapping is what every decomposed run clones. Without it the runs have nothing
+  // to act on (the old failure mode).
+  const repoMapped = Boolean(selectedProject?.repoUrl);
 
-  const taskMutation = useMutation({
-    mutationFn: (payload: { objective: string; linearProjectId?: string }) =>
-      fetchJson<TaskResponse>("/api/tasks", {
+  const goalMutation = useMutation({
+    mutationFn: (payload: { objective: string; linearProjectId: string }) =>
+      fetchJson<GoalResult>("/api/goals", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
@@ -24,19 +36,17 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
     onSuccess: () => {
       setObjective("");
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
+      void queryClient.invalidateQueries({ queryKey: ["goals"] });
     },
   });
 
-  function submitTask(event: FormEvent<HTMLFormElement>) {
+  function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    taskMutation.mutate({
-      objective,
-      linearProjectId:
-        selectedProject && selectedProject.id !== "linear_pending"
-          ? selectedProject.id
-          : undefined,
-    });
+    if (!selectedProject) return;
+    goalMutation.mutate({ objective, linearProjectId: selectedProject.id });
   }
+
+  const result = goalMutation.data;
 
   return (
     <Card withBorder radius="md" padding="lg">
@@ -45,72 +55,90 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
           Goal Intake
         </Title>
         <Badge color="teal" variant="light">
-          approval gated
+          breaks into issues → VMs
         </Badge>
       </Group>
-      <form onSubmit={submitTask}>
+      <form onSubmit={submit}>
         <Stack gap="sm">
           <Select
             label="Project"
-            data={projects.map((project) => ({ value: project.id, label: project.name }))}
+            description="The goal's issues and runs target this project's mapped repo."
+            data={projects.map((project) => ({
+              value: project.id,
+              label: project.repoUrl ? project.name : `${project.name} (no repo mapped)`,
+            }))}
             value={selectedProject?.id ?? null}
             onChange={setSelectedProjectId}
             placeholder="Select a project"
-            nothingFoundMessage="No projects"
+            nothingFoundMessage="No projects — sync Linear first"
           />
+          {selectedProject ? (
+            <Text size="xs" c={repoMapped ? "dimmed" : "orange"}>
+              {repoMapped
+                ? `Target repo: ${selectedProject.repoUrl}`
+                : "This project has no GitHub repo mapped. Map one in Linear Projects below before running a goal."}
+            </Text>
+          ) : null}
           <Textarea
-            label="Objective"
+            label="Goal"
+            description="Describe the outcome. It'll be decomposed into Linear issues, one VM run each."
             autosize
             minRows={4}
             value={objective}
             onChange={(event) => setObjective(event.currentTarget.value)}
-            placeholder="Ship the next verified iteration for this Linear project"
+            placeholder="e.g. Add SSO login with Google and GitHub, including tests and docs"
           />
           <Group justify="space-between">
             <Text c="dimmed" size="sm">
-              Manual approval required before sandbox execution
+              Runs execute autonomously on Claude Code (Gemma failover on usage limit)
             </Text>
             <Button
               type="submit"
-              loading={taskMutation.isPending}
-              disabled={objective.trim().length < 4}
+              loading={goalMutation.isPending}
+              disabled={objective.trim().length < 4 || !selectedProject || !repoMapped}
             >
-              Queue task
+              Plan & run goal
             </Button>
           </Group>
         </Stack>
       </form>
 
-      {taskMutation.isSuccess && taskMutation.data ? (
-        <Alert color="teal" variant="light" mt="md" title="Task queued">
+      {goalMutation.isPending ? (
+        <Text size="sm" c="dimmed" mt="md">
+          Breaking the goal into issues and dispatching runs…
+        </Text>
+      ) : null}
+
+      {result ? (
+        <Alert color="teal" variant="light" mt="md" title="Goal dispatched">
           <Stack gap="xs" align="flex-start">
-            <Text size="sm">
-              <Text span ff="monospace">{taskMutation.data.id}</Text>
-              {" · "}
-              {taskMutation.data.status}
-              {taskMutation.data.approvalRequired
-                ? " — waiting for your approval before it runs."
-                : " — starting now."}
+            {result.summary ? <Text size="sm">{result.summary}</Text> : null}
+            <Text size="sm" fw={600}>
+              {result.createdIssues.length} issue(s) created · {result.queuedRuns.length} run(s) started
+              {result.skipped > 0 ? ` · ${result.skipped} queued behind the run cap` : ""}
             </Text>
-            {/* Approval-gated runs are approved in Recent Runs on this page and
-                don't appear in the Command Center (which only shows active runs),
-                so only link there once the run is actually starting. */}
-            {taskMutation.data.approvalRequired ? (
-              <Text size="xs" c="dimmed">
-                Approve it in Recent Runs below to start execution.
-              </Text>
-            ) : (
+            <Stack gap={2}>
+              {result.createdIssues.map((issue) => (
+                <Anchor key={issue.id} href={issue.url} target="_blank" rel="noopener noreferrer" size="xs">
+                  <Text component="span" size="xs" c="dimmed" mr={6}>
+                    {issue.identifier}
+                  </Text>
+                  {issue.title}
+                </Anchor>
+              ))}
+            </Stack>
+            {result.queuedRuns.length > 0 ? (
               <Button component={Link} to="/command-center" size="xs" variant="light" color="teal">
-                View in Command Center
+                Watch runs in Command Center
               </Button>
-            )}
+            ) : null}
           </Stack>
         </Alert>
       ) : null}
 
-      {taskMutation.isError ? (
-        <Alert color="red" variant="light" mt="md" title="Couldn't queue task">
-          <Text size="sm">{(taskMutation.error as Error)?.message ?? "Request failed"}</Text>
+      {goalMutation.isError ? (
+        <Alert color="red" variant="light" mt="md" title="Couldn't run this goal">
+          <Text size="sm">{(goalMutation.error as Error)?.message ?? "Request failed"}</Text>
         </Alert>
       ) : null}
     </Card>
