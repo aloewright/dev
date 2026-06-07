@@ -70,6 +70,7 @@ import { runGoal, listGoals } from "./platform/goal";
 import { getCore, getCoreResponse, saveCore, buildCorePreamble } from "./platform/core";
 import { listWorkflows, saveWorkflow, deleteWorkflow } from "./platform/workflows";
 import { ingestKnowledge } from "./platform/knowledge";
+import { generateTextResponse } from "./platform/ai";
 import {
   isRetryableError,
   isCapacityError,
@@ -715,6 +716,14 @@ app.post("/api/knowledge", async (c) => {
   const form = await c.req.formData().catch(() => null);
   if (!form) return c.json({ error: "Expected multipart form data" }, 400);
   return ingestKnowledge(c.env, user, form);
+});
+
+// Editor /ai slash command: generate text via the AI Gateway.
+app.post("/api/ai/generate", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const payload = await c.req.json().catch(() => ({}));
+  return generateTextResponse(c.env, user, payload as { prompt?: unknown; context?: unknown });
 });
 
 app.post("/api/runs/:id/approve", async (c) => {
