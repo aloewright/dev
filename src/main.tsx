@@ -17,6 +17,7 @@ import "@fontsource/nunito/800.css";
 // Mantine styles are imported (in a cascade layer) from styles.css so they sit
 // in the correct order relative to Tailwind.
 import "@/styles.css";
+import "@mantine/spotlight/styles.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {
