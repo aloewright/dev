@@ -68,6 +68,7 @@ import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/g
 import { continueProject } from "./platform/continue";
 import { runGoal, listGoals } from "./platform/goal";
 import { getCore, getCoreResponse, saveCore, buildCorePreamble } from "./platform/core";
+import { listWorkflows, saveWorkflow, deleteWorkflow } from "./platform/workflows";
 import {
   isRetryableError,
   isCapacityError,
@@ -683,6 +684,26 @@ app.put("/api/core", async (c) => {
   if (user instanceof Response) return user;
   const payload = await c.req.json().catch(() => ({}));
   return saveCore(c.env, user, payload as { soul?: unknown; rules?: unknown });
+});
+
+// Workflows: reusable parameterized goal templates.
+app.get("/api/workflows", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return listWorkflows(c.env, user);
+});
+
+app.post("/api/workflows", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const payload = await c.req.json().catch(() => ({}));
+  return saveWorkflow(c.env, user, payload as Record<string, unknown>);
+});
+
+app.delete("/api/workflows/:id", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return deleteWorkflow(c.env, user, c.req.param("id"));
 });
 
 app.post("/api/runs/:id/approve", async (c) => {

@@ -1,7 +1,7 @@
 /* AGPL-3.0-or-later */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell, NavLink, Title, Box, Text, Button, Stack } from "@mantine/core";
-import { IconDashboard, IconActivityHeartbeat, IconListDetails, IconSettings, IconBrain } from "@tabler/icons-react";
+import { IconDashboard, IconActivityHeartbeat, IconListDetails, IconSettings, IconBrain, IconTemplate } from "@tabler/icons-react";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { fetchJson } from "@/lib/api";
 import { getBannerFromUrl } from "@/lib/dashboard";
@@ -13,6 +13,7 @@ const NAV = [
   { to: "/runs", label: "Runs", icon: IconListDetails },
   { to: "/command-center", label: "Command Center", icon: IconActivityHeartbeat },
   { to: "/core", label: "Core", icon: IconBrain },
+  { to: "/workflows", label: "Workflows", icon: IconTemplate },
   { to: "/settings", label: "Settings", icon: IconSettings },
 ] as const;
 
