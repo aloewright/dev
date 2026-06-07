@@ -690,7 +690,16 @@ async function handleRunInner(rawBody) {
     const activeToken = clone.activeToken;
     if (clone.code !== 0 || !activeToken) {
       const errorClass = clone.errorClass ?? classifyCloneError(clone.stderr);
-      step(job.runId, "clone:failed", { code: clone.code, errorClass });
+      // Surface the real git stderr (last line) on the event so the failure reason
+      // is visible without digging into agent.result metadata. e.g. a 403
+      // "Write access to repository not granted" reads as an auth/permission gap,
+      // not an opaque transient.
+      const reason = (clone.stderr || "")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .slice(-1)[0];
+      step(job.runId, "clone:failed", { code: clone.code, errorClass, reason });
       return { ok: false, error: errorClass, logs: (clone.stderr || "").slice(-4000) };
     }
     // Record the actual default branch we landed on (used as PR base + diff base).
