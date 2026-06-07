@@ -388,7 +388,12 @@ export async function resolveRunPlan(env: Env, runId: string): Promise<RunPlan |
   const metaRepo = typeof meta.repoName === "string" ? meta.repoName : null;
   const repo =
     metaOwner && metaRepo
-      ? { owner: metaOwner, repo: metaRepo, baseBranch: "main", url: `https://github.com/${metaOwner}/${metaRepo}` }
+      ? {
+          owner: metaOwner,
+          repo: metaRepo,
+          baseBranch: await repoDefaultBranch(env, metaOwner, metaRepo),
+          url: `https://github.com/${metaOwner}/${metaRepo}`,
+        }
       : await resolveRepoCoords(env, run.repo_mapping_id, run.project_id);
 
   return {
@@ -493,7 +498,25 @@ async function resolveRepoCoords(
     );
   }
   if (!row) return null;
-  return { owner: row.owner, repo: row.repo, url: row.url, baseBranch: "main" };
+  return {
+    owner: row.owner,
+    repo: row.repo,
+    url: row.url,
+    baseBranch: await repoDefaultBranch(env, row.owner, row.repo),
+  };
+}
+
+// The base branch must be the repo's real default — cloning/checking out a
+// hardcoded "main" against a repo whose default is "master" (or anything else)
+// fails with git exit 128, which the container misreads as a transient clone
+// error and retries to death. github_repos.default_branch is synced from the API.
+async function repoDefaultBranch(env: Env, owner: string, repo: string): Promise<string> {
+  const r = await first<{ default_branch: string | null }>(
+    env,
+    "SELECT default_branch FROM github_repos WHERE owner = ? AND name = ? ORDER BY synced_at DESC LIMIT 1",
+    [owner, repo],
+  );
+  return r?.default_branch || "main";
 }
 
 // Create a run and, when CONTINUE_AUTONOMY is enabled, immediately approve it so it
