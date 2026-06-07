@@ -1,10 +1,9 @@
 /* AGPL-3.0-or-later */
 import { useQuery } from "@tanstack/react-query";
-import { Alert, Box, Button, ScrollArea, Stack, Text } from "@mantine/core";
+import { Alert, Box, Button, Stack, Text } from "@mantine/core";
 import { fetchJson } from "@/lib/api";
 import { getBannerFromUrl } from "@/lib/dashboard";
 import { GoalIntakeCard } from "@/components/GoalIntakeCard";
-import { GoalsCard } from "@/components/GoalsCard";
 import type { Overview } from "@/types";
 
 // Dashboard = Plan. The single thing the portal exists to do: describe a goal and
@@ -36,16 +35,10 @@ export function App() {
         </Alert>
       ) : null}
 
-      {/* Plan zone is fixed at top; goal history scrolls below it. */}
-      <Box style={{ flexShrink: 0, maxWidth: 760, width: "100%" }}>
+      {/* Plan: describe a goal and launch it. Progress lives in the Runs tab. */}
+      <Box style={{ maxWidth: 760, width: "100%" }}>
         <GoalIntakeCard projects={overview?.projects ?? []} />
       </Box>
-
-      <ScrollArea h="100%" type="auto" style={{ flex: 1, minHeight: 0, maxWidth: 760 }}>
-        <Box pr="sm">
-          <GoalsCard />
-        </Box>
-      </ScrollArea>
     </Box>
   );
 }
