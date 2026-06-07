@@ -20,6 +20,9 @@ const MAX_ISSUES = 6;
 // (dynamic/research_gen) are NOT resolvable from inside a Worker today — see
 // ~/.claude/CLAUDE.md "Inside a Worker". Swap back to a dynamic route when fixed.
 const PLANNER_MODEL = "@cf/openai/gpt-oss-120b";
+// Goal decomposition uses NVIDIA Nemotron on Workers AI — a stronger reasoning
+// model for turning a free-text goal into well-scoped Linear issues.
+const GOAL_MODEL = "@cf/nvidia/nemotron-3-120b-a12b";
 const PLANNER_MAX_TOKENS = 2048;
 
 const PLANNER_SYSTEM =
@@ -32,7 +35,7 @@ const PLANNER_SYSTEM =
   "issues that should begin immediately. Do not duplicate work already covered by an open issue.";
 
 export async function planNextSteps(env: Env, ctx: ProjectContext): Promise<NextStepPlan | null> {
-  return runPlanner(env, PLANNER_SYSTEM, buildPlannerPrompt(ctx));
+  return runPlanner(env, PLANNER_SYSTEM, buildPlannerPrompt(ctx), PLANNER_MODEL);
 }
 
 const GOAL_SYSTEM =
@@ -49,10 +52,15 @@ const GOAL_SYSTEM =
 // Decompose a free-text GOAL (not a project's standing state) into issues. Used by
 // the goal-intake pipeline; reuses the same JSON contract as planNextSteps.
 export async function planGoal(env: Env, ctx: ProjectContext, goal: string): Promise<NextStepPlan | null> {
-  return runPlanner(env, GOAL_SYSTEM, buildGoalPrompt(ctx, goal));
+  return runPlanner(env, GOAL_SYSTEM, buildGoalPrompt(ctx, goal), GOAL_MODEL);
 }
 
-async function runPlanner(env: Env, system: string, userPrompt: string): Promise<NextStepPlan | null> {
+async function runPlanner(
+  env: Env,
+  system: string,
+  userPrompt: string,
+  model: string,
+): Promise<NextStepPlan | null> {
   const gatewayId = env.AI_GATEWAY_ID || "x";
   let raw: unknown;
   try {
@@ -61,7 +69,7 @@ async function runPlanner(env: Env, system: string, userPrompt: string): Promise
         run: (m: string, i: unknown, o: { gateway: { id: string } }) => Promise<unknown>;
       }
     ).run(
-      PLANNER_MODEL,
+      model,
       {
         messages: [
           { role: "system", content: system },
