@@ -15,6 +15,17 @@ RUN apt-get update \
        python3 python3-pip python3-venv python3-dev \
   && rm -rf /var/lib/apt/lists/*
 
+# Git-over-HTTPS hardening for the sandbox's egress path. Debian git links
+# libcurl3-gnutls; HTTP/2 multiplexing through the container egress was
+# terminating clones mid-stream with "GnuTLS recv error (-110): The TLS
+# connection was non-properly terminated" (observed failing 3/3 retries on
+# every run). Force HTTP/1.1 and enlarge the buffer system-wide so clone/fetch/
+# push are resilient regardless of which user runs git.
+RUN git config --system http.version HTTP/1.1 \
+  && git config --system http.postBuffer 524288000 \
+  && git config --system http.lowSpeedLimit 1000 \
+  && git config --system http.lowSpeedTime 60
+
 # Go toolchain (arch-matched to the build platform). GOTOOLCHAIN=local pins to
 # this version so a repo's go.mod cannot trigger an out-of-band toolchain
 # download at test time.
