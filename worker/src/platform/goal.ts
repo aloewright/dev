@@ -7,6 +7,7 @@ import { planGoal, type ProjectContext } from "./planner";
 import { createLinearIssue, resolveProjectTeam, type CreatedLinearIssue } from "./linear";
 import { createAutonomousRun } from "./orchestration";
 import { activeRepo, executeCap } from "./continue";
+import { getCore, buildCorePreamble } from "./core";
 
 export type GoalResult = {
   goalId: string;
@@ -76,7 +77,8 @@ export async function runGoal(
     repo: `${repo.owner}/${repo.repo}`,
   };
 
-  const plan = await planGoal(env, ctx, objective);
+  const core = buildCorePreamble(await getCore(env, user.id));
+  const plan = await planGoal(env, ctx, objective, core);
   if (!plan) {
     return Response.json({ error: "Could not break this goal into tasks. Try rephrasing it." }, { status: 502 });
   }
