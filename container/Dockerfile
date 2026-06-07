@@ -15,13 +15,35 @@ RUN apt-get update \
        python3 python3-pip python3-venv python3-dev \
   && rm -rf /var/lib/apt/lists/*
 
+# Rebuild git against OpenSSL libcurl. The Debian prebuilt git links
+# libcurl3-gnutls, whose TLS connections to github.com are dropped mid-clone from
+# the container egress ("GnuTLS recv error (-110): The TLS connection was
+# non-properly terminated" — confirmed the clone fails on TLS, not auth). The
+# worker's OpenSSL fetch to the same repo returns 200, so building git against
+# libcurl4-openssl-dev (same TLS stack) removes the -110 clone failures. The
+# from-source binaries land in /usr/local/bin, which precedes /usr/bin on PATH.
+ARG GIT_VERSION=2.47.1
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+       libcurl4-openssl-dev libssl-dev zlib1g-dev gettext libexpat1-dev \
+  && curl -fsSL "https://www.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.gz" -o /tmp/git.tgz \
+  && mkdir -p /tmp/git-src && tar -C /tmp/git-src --strip-components=1 -xzf /tmp/git.tgz \
+  && make -C /tmp/git-src prefix=/usr/local -j"$(nproc)" all \
+  && make -C /tmp/git-src prefix=/usr/local install \
+  && rm -rf /tmp/git.tgz /tmp/git-src /var/lib/apt/lists/* \
+  && hash -r \
+  && git --version \
+  && (ldd "$(git --exec-path)/git-remote-https" | grep -i curl || true)
+
 # Git-over-HTTPS hardening for the sandbox's egress path. Debian git links
-# libcurl3-gnutls; HTTP/2 multiplexing through the container egress was
-# terminating clones mid-stream with "GnuTLS recv error (-110): The TLS
-# connection was non-properly terminated" (observed failing 3/3 retries on
-# every run). Force HTTP/1.1 and enlarge the buffer system-wide so clone/fetch/
-# push are resilient regardless of which user runs git.
+# libcurl3-gnutls, whose TLS 1.3 handshakes through the container egress are
+# terminated mid-clone with "GnuTLS recv error (-110): The TLS connection was
+# non-properly terminated" (confirmed via per-token logging: the clone fails on
+# TLS, not auth — the PAT is valid). Pinning TLS 1.2 + HTTP/1.1 sidesteps the
+# gnutls/TLS1.3 + middlebox interaction; the buffer/low-speed settings keep
+# large clone/fetch/push resilient. Applied system-wide so any user's git uses it.
 RUN git config --system http.version HTTP/1.1 \
+  && git config --system http.sslVersion tlsv1.2 \
   && git config --system http.postBuffer 524288000 \
   && git config --system http.lowSpeedLimit 1000 \
   && git config --system http.lowSpeedTime 60
