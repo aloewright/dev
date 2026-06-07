@@ -35,7 +35,7 @@ const PLANNER_SYSTEM =
   "issues that should begin immediately. Do not duplicate work already covered by an open issue.";
 
 export async function planNextSteps(env: Env, ctx: ProjectContext): Promise<NextStepPlan | null> {
-  return runPlanner(env, PLANNER_SYSTEM, buildPlannerPrompt(ctx), PLANNER_MODEL);
+  return runPlanner(env, PLANNER_SYSTEM, buildPlannerPrompt(ctx), [PLANNER_MODEL]);
 }
 
 const GOAL_SYSTEM =
@@ -52,10 +52,27 @@ const GOAL_SYSTEM =
 // Decompose a free-text GOAL (not a project's standing state) into issues. Used by
 // the goal-intake pipeline; reuses the same JSON contract as planNextSteps.
 export async function planGoal(env: Env, ctx: ProjectContext, goal: string): Promise<NextStepPlan | null> {
-  return runPlanner(env, GOAL_SYSTEM, buildGoalPrompt(ctx, goal), GOAL_MODEL);
+  // Prefer Nemotron; fall back to the proven gpt-oss model if Nemotron errors or
+  // returns nothing usable through the binding, so goal decomposition never
+  // dead-ends with "couldn't break this goal into tasks".
+  return runPlanner(env, GOAL_SYSTEM, buildGoalPrompt(ctx, goal), [GOAL_MODEL, PLANNER_MODEL]);
 }
 
 async function runPlanner(
+  env: Env,
+  system: string,
+  userPrompt: string,
+  models: string[],
+): Promise<NextStepPlan | null> {
+  // Try each model in order; the first that yields a usable plan wins.
+  for (const model of models) {
+    const plan = await runOnePlanner(env, system, userPrompt, model);
+    if (plan) return plan;
+  }
+  return null;
+}
+
+async function runOnePlanner(
   env: Env,
   system: string,
   userPrompt: string,
@@ -80,8 +97,8 @@ async function runPlanner(
       { gateway: { id: gatewayId } },
     );
   } catch {
-    // AI gateway error/timeout — treat as "no usable plan" so the caller returns a
-    // clean 502 instead of a bare 500.
+    // AI gateway error/timeout — treat as "no usable plan" so the caller can fall
+    // back to the next model (and ultimately return a clean 502, not a 500).
     return null;
   }
   return extractJsonPlan(readContent(raw));
@@ -119,9 +136,18 @@ function buildPlannerPrompt(ctx: ProjectContext): string {
   ].join("\n");
 }
 
+// The AI binding returns either the OpenAI-style `choices[0].message.content`
+// (gpt-oss, and Nemotron via REST) or the Workers AI native `{ response }` shape,
+// depending on the model. Read both so a model isn't silently dropped to null.
 function readContent(raw: unknown): string | null {
-  const r = raw as { choices?: Array<{ message?: { content?: string | null } }> };
-  return r?.choices?.[0]?.message?.content ?? null;
+  const r = raw as {
+    choices?: Array<{ message?: { content?: string | null } }>;
+    response?: unknown;
+  };
+  const fromChoices = r?.choices?.[0]?.message?.content;
+  if (typeof fromChoices === "string" && fromChoices.trim()) return fromChoices;
+  if (typeof r?.response === "string" && r.response.trim()) return r.response;
+  return null;
 }
 
 // Parse the model's text into a NextStepPlan. Tolerates ```json fences and
