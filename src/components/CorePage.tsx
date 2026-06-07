@@ -1,9 +1,10 @@
 /* AGPL-3.0-or-later */
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Box, Button, Card, FileInput, Group, ScrollArea, Select, Stack, Text, Textarea, Title } from "@mantine/core";
+import { Box, Button, Card, FileInput, Group, ScrollArea, Select, Stack, Text, Title } from "@mantine/core";
 import { IconUpload } from "@tabler/icons-react";
 import { fetchJson } from "@/lib/api";
+import { AiRichText } from "@/components/AiRichText";
 import type { Overview } from "@/types";
 
 type Core = { soul: string; rules: string };
@@ -112,28 +113,18 @@ export function CorePage() {
         <Stack gap="md" pr="sm" maw={860}>
           <Card withBorder radius="md" padding="lg">
             <Text fw={600} mb={2}>Soul</Text>
-            <Text c="dimmed" size="xs" mb="sm">Identity, values, and guardrails — what "done" means, the quality/security bar, tone, and what to never do.</Text>
-            <Textarea
-              autosize
-              minRows={6}
-              maxRows={16}
-              value={soul}
-              onChange={(e) => { setSoul(e.currentTarget.value); setDirty(true); }}
-              placeholder={"e.g. You are a senior engineer on the fly platform. Prefer small, well-tested changes. Never touch production secrets or billing. Route all model calls through the Cloudflare AI Gateway, never provider SDKs."}
-            />
+            <Text c="dimmed" size="xs" mb="sm">Identity, values, and guardrails — what "done" means, the quality/security bar, tone, and what to never do. Type <strong>/</strong> for AI generation.</Text>
+            {query.data ? (
+              <AiRichText value={query.data.soul} onChange={(md) => { setSoul(md); setDirty(true); }} />
+            ) : null}
           </Card>
 
           <Card withBorder radius="md" padding="lg">
             <Text fw={600} mb={2}>Rules</Text>
-            <Text c="dimmed" size="xs" mb="sm">Always-follow instructions applied to every run.</Text>
-            <Textarea
-              autosize
-              minRows={6}
-              maxRows={16}
-              value={rules}
-              onChange={(e) => { setRules(e.currentTarget.value); setDirty(true); }}
-              placeholder={"e.g.\n- Always add or update tests for changed code.\n- Use camelCase filenames and alias imports.\n- Keep PRs focused; one concern per PR.\n- Update docs when behavior changes."}
-            />
+            <Text c="dimmed" size="xs" mb="sm">Always-follow instructions applied to every run. Type <strong>/</strong> for AI generation.</Text>
+            {query.data ? (
+              <AiRichText value={query.data.rules} onChange={(md) => { setRules(md); setDirty(true); }} />
+            ) : null}
           </Card>
 
           <Group justify="flex-end" gap="sm">

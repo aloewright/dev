@@ -1,11 +1,12 @@
 /* AGPL-3.0-or-later */
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Box, Button, Card, Group, ScrollArea, Stack, Text, TextInput, Textarea, Title, UnstyledButton } from "@mantine/core";
+import { Box, Button, Card, Group, ScrollArea, Stack, Text, TextInput, Title, UnstyledButton } from "@mantine/core";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { fetchJson } from "@/lib/api";
 import { rowBorder } from "@/lib/dashboard";
 import { EmptyRow } from "@/components/primitives";
+import { AiRichText } from "@/components/AiRichText";
 
 type Workflow = { id: string; name: string; description: string; template: string; updatedAt?: string };
 
@@ -83,16 +84,15 @@ export function WorkflowsPage() {
               <Stack gap="sm" pr="sm">
                 <TextInput label="Name" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.currentTarget.value })} placeholder="e.g. Add CRUD endpoint" />
                 <TextInput label="Description" value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.currentTarget.value })} placeholder="When to use this" />
-                <Textarea
-                  label="Template"
-                  description="The goal text. Use {placeholders} for fill-ins."
-                  autosize
-                  minRows={6}
-                  maxRows={18}
-                  value={draft.template}
-                  onChange={(e) => setDraft({ ...draft, template: e.currentTarget.value })}
-                  placeholder={"Add a CRUD endpoint for {entity} with input validation and tests. Follow existing route conventions and update the OpenAPI spec."}
-                />
+                <div>
+                  <Text size="sm" fw={500} mb={2}>Template</Text>
+                  <Text c="dimmed" size="xs" mb={4}>The goal text. Use {"{placeholders}"} for fill-ins. Type <strong>/</strong> for AI generation.</Text>
+                  <AiRichText
+                    key={draft.id || "new"}
+                    value={draft.template}
+                    onChange={(md) => setDraft((d) => (d ? { ...d, template: md } : d))}
+                  />
+                </div>
                 <Group justify="space-between">
                   {draft.id ? (
                     <Button size="xs" variant="subtle" color="red" leftSection={<IconTrash size={14} />} loading={remove.isPending} onClick={() => remove.mutate(draft.id)}>Delete</Button>
