@@ -51,11 +51,13 @@ const GOAL_SYSTEM =
 
 // Decompose a free-text GOAL (not a project's standing state) into issues. Used by
 // the goal-intake pipeline; reuses the same JSON contract as planNextSteps.
-export async function planGoal(env: Env, ctx: ProjectContext, goal: string): Promise<NextStepPlan | null> {
+export async function planGoal(env: Env, ctx: ProjectContext, goal: string, core = ""): Promise<NextStepPlan | null> {
   // Prefer Nemotron; fall back to the proven gpt-oss model if Nemotron errors or
   // returns nothing usable through the binding, so goal decomposition never
-  // dead-ends with "couldn't break this goal into tasks".
-  return runPlanner(env, GOAL_SYSTEM, buildGoalPrompt(ctx, goal), [GOAL_MODEL, PLANNER_MODEL]);
+  // dead-ends with "couldn't break this goal into tasks". The user's global core
+  // (soul + rules) is prepended to the system prompt when present.
+  const system = core ? `${core}\n\n${GOAL_SYSTEM}` : GOAL_SYSTEM;
+  return runPlanner(env, system, buildGoalPrompt(ctx, goal), [GOAL_MODEL, PLANNER_MODEL]);
 }
 
 async function runPlanner(

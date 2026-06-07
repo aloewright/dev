@@ -67,6 +67,7 @@ import { writeBackToLinear } from "./platform/linear";
 import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/github";
 import { continueProject } from "./platform/continue";
 import { runGoal, listGoals } from "./platform/goal";
+import { getCore, getCoreResponse, saveCore, buildCorePreamble } from "./platform/core";
 import {
   isRetryableError,
   isCapacityError,
@@ -667,6 +668,21 @@ app.get("/api/goals", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
   return listGoals(c.env, user);
+});
+
+// Core: global soul (identity/values/guardrails) + rules, injected into
+// decomposition and every run prompt.
+app.get("/api/core", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  return getCoreResponse(c.env, user);
+});
+
+app.put("/api/core", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const payload = await c.req.json().catch(() => ({}));
+  return saveCore(c.env, user, payload as { soul?: unknown; rules?: unknown });
 });
 
 app.post("/api/runs/:id/approve", async (c) => {
@@ -1362,6 +1378,13 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
         ).catch(() => {});
       } catch {
         priorContext = "";
+      }
+      // Prepend the user's global soul + rules so every run honors them.
+      try {
+        const preamble = buildCorePreamble(await getCore(this.env, payload.userId));
+        if (preamble) priorContext = [preamble, priorContext].filter(Boolean).join("\n\n---\n\n");
+      } catch {
+        /* best-effort */
       }
       const containerNamespace = this.env.SANDBOX_CONTAINER as unknown as DurableObjectNamespace<Container<Env>>;
       const container = getContainer(containerNamespace, sandboxId);
