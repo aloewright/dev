@@ -6,6 +6,7 @@ import { RouterProvider } from "@tanstack/react-router";
 import { ColorSchemeScript, MantineProvider } from "@mantine/core";
 import { router } from "@/router";
 import { theme } from "@/theme";
+import { ErrorBoundary } from "@/ErrorBoundary";
 
 // Nunito weights used across the UI.
 import "@fontsource/nunito/400.css";
@@ -31,7 +32,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <ColorSchemeScript defaultColorScheme="dark" />
     <MantineProvider theme={theme} defaultColorScheme="dark">
       <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
+        <ErrorBoundary>
+          <RouterProvider router={router} />
+        </ErrorBoundary>
       </QueryClientProvider>
     </MantineProvider>
   </React.StrictMode>,
