@@ -30,6 +30,11 @@ export function RunCard({ run, onFinished }: { run: ActiveRun; onFinished?: (id:
   const [conn, setConn] = useState<Conn>("connecting");
   const viewport = useRef<HTMLDivElement>(null);
   const qc = useQueryClient();
+  // Keep the latest onFinished without making it an effect dependency — otherwise
+  // a non-memoized callback from the parent would tear down and reopen the SSE
+  // stream on every render.
+  const onFinishedRef = useRef(onFinished);
+  onFinishedRef.current = onFinished;
 
   useEffect(() => {
     const isLocal = typeof window !== "undefined" && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname);
@@ -49,19 +54,19 @@ export function RunCard({ run, onFinished }: { run: ActiveRun; onFinished?: (id:
       const next = (JSON.parse((e as MessageEvent).data) as { status: string }).status;
       setStatus(next);
       // Once the run reaches a terminal state, drop it from the Command Center immediately.
-      if (TERMINAL.has(next)) onFinished?.(run.id);
+      if (TERMINAL.has(next)) onFinishedRef.current?.(run.id);
     });
     es.addEventListener("done", () => {
       ended = true;
       setConn("ended");
       es.close();
-      onFinished?.(run.id);
+      onFinishedRef.current?.(run.id);
     });
     return () => {
       ended = true;
       es.close();
     };
-  }, [run.id, onFinished]);
+  }, [run.id]);
 
   useEffect(() => {
     viewport.current?.scrollTo({ top: viewport.current.scrollHeight });

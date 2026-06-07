@@ -1,21 +1,29 @@
 /* AGPL-3.0-or-later */
-import { Component, ReactNode } from "react";
+import { Component, ErrorInfo, ReactNode } from "react";
 import { Alert, Box, Button, Code, Container, Stack, Text, Title } from "@mantine/core";
 
 interface Props { children: ReactNode }
-interface State { error: Error | null }
+interface State { error: unknown }
 
 // Catches render-time crashes anywhere below the router so a single bad component
 // shows a recoverable error card instead of a white screen.
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
 
-  static getDerivedStateFromError(error: Error): State {
+  static getDerivedStateFromError(error: unknown): State {
     return { error };
+  }
+
+  componentDidCatch(error: unknown, errorInfo: ErrorInfo) {
+    // Hook for a monitoring service (Sentry/Datadog). For now, surface the
+    // component stack to the console alongside React's own logging.
+    console.error("ErrorBoundary caught:", error, errorInfo.componentStack);
   }
 
   render() {
     if (!this.state.error) return this.props.children;
+    const message =
+      this.state.error instanceof Error ? this.state.error.message : String(this.state.error);
     return (
       <Box mih="100vh" bg="var(--mantine-color-body)">
         <Container size="sm" py="xl">
@@ -26,7 +34,7 @@ export class ErrorBoundary extends Component<Props, State> {
                 <Text size="sm">
                   This is a bug in the dashboard, not your account. Reloading usually clears it.
                 </Text>
-                <Code block>{this.state.error.message}</Code>
+                <Code block>{message}</Code>
               </Stack>
             </Alert>
             <Button onClick={() => window.location.reload()} w="fit-content">

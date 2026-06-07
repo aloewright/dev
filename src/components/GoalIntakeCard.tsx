@@ -92,16 +92,25 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
                 ? " — waiting for your approval before it runs."
                 : " — starting now."}
             </Text>
-            <Button component={Link} to="/command-center" size="xs" variant="light" color="teal">
-              View in Command Center
-            </Button>
+            {/* Approval-gated runs are approved in Recent Runs on this page and
+                don't appear in the Command Center (which only shows active runs),
+                so only link there once the run is actually starting. */}
+            {taskMutation.data.approvalRequired ? (
+              <Text size="xs" c="dimmed">
+                Approve it in Recent Runs below to start execution.
+              </Text>
+            ) : (
+              <Button component={Link} to="/command-center" size="xs" variant="light" color="teal">
+                View in Command Center
+              </Button>
+            )}
           </Stack>
         </Alert>
       ) : null}
 
       {taskMutation.isError ? (
         <Alert color="red" variant="light" mt="md" title="Couldn't queue task">
-          <Text size="sm">{(taskMutation.error as Error).message}</Text>
+          <Text size="sm">{(taskMutation.error as Error)?.message ?? "Request failed"}</Text>
         </Alert>
       ) : null}
     </Card>
