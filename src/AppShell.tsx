@@ -1,8 +1,9 @@
 /* AGPL-3.0-or-later */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AppShell, NavLink, Title, Box, Text, Button, Stack } from "@mantine/core";
-import { IconDashboard, IconActivityHeartbeat, IconListDetails, IconSettings, IconBrain, IconTemplate } from "@tabler/icons-react";
-import { Link, Outlet, useRouterState } from "@tanstack/react-router";
+import { Spotlight, spotlight, type SpotlightActionData } from "@mantine/spotlight";
+import { IconDashboard, IconActivityHeartbeat, IconListDetails, IconSettings, IconBrain, IconTemplate, IconSearch } from "@tabler/icons-react";
+import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { fetchJson } from "@/lib/api";
 import { getBannerFromUrl } from "@/lib/dashboard";
 import { SignInForm } from "@/components/SignInForm";
@@ -19,7 +20,14 @@ const NAV = [
 
 export function RootLayout() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const spotlightActions: SpotlightActionData[] = NAV.map((n) => ({
+    id: n.to,
+    label: n.label,
+    leftSection: <n.icon size={18} />,
+    onClick: () => navigate({ to: n.to }),
+  }));
   const overviewQuery = useQuery({
     queryKey: ["overview"],
     queryFn: () => fetchJson<Overview>("/api/overview"),
@@ -44,6 +52,17 @@ export function RootLayout() {
           <Box mb="sm">
             <Title order={4}>Fly Dev</Title>
           </Box>
+          <Button
+            variant="default"
+            size="xs"
+            justify="space-between"
+            leftSection={<IconSearch size={14} />}
+            rightSection={<Text size="xs" c="dimmed">⌘K</Text>}
+            onClick={() => spotlight.open()}
+            mb="xs"
+          >
+            Search
+          </Button>
           {NAV.map((n) => (
             <NavLink
               key={n.to}
@@ -70,6 +89,12 @@ export function RootLayout() {
       <AppShell.Main style={{ height: "100dvh", overflow: "hidden", display: "flex", flexDirection: "column" }}>
         <Outlet />
       </AppShell.Main>
+      <Spotlight
+        actions={spotlightActions}
+        shortcut="mod + K"
+        nothingFound="Nothing found"
+        searchProps={{ placeholder: "Jump to…", leftSection: <IconSearch size={18} /> }}
+      />
     </AppShell>
   );
 }
