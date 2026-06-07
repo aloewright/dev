@@ -342,9 +342,11 @@ async function runTestGate(repoDir) {
 
 function testStatusLine(gate) {
   if (!gate.ran) return `⚠️ ${gate.summary}`;
-  return gate.passed
-    ? `✅ Tests passed (${gate.projectType})`
-    : `❌ Tests failed (${gate.projectType}, exit ${gate.exitCode})`;
+  if (gate.passed) return `✅ Tests passed (${gate.projectType})`;
+  if (gate.preexisting) {
+    return `⚠️ Tests failing (${gate.projectType}, exit ${gate.exitCode}) — already failing on the base branch before this change, so it was not treated as a regression.`;
+  }
+  return `❌ Tests failed (${gate.projectType}, exit ${gate.exitCode})`;
 }
 
 async function openPullRequest(job, head, base, title, body, draft, token) {
@@ -371,9 +373,42 @@ async function openPullRequest(job, head, base, title, body, draft, token) {
 
 // Run the test gate; if it fails, have the agent fix it and re-test, up to
 // MAX_FIX_ATTEMPTS. Commits each fix attempt. Returns the final gate verdict.
-async function ensureTestsPass(job, repoDir) {
+// Run the test gate against a clean checkout of the base commit (separate git
+// worktree, fresh install) to tell whether a failing suite was ALREADY broken
+// before the agent touched anything. Returns the gate verdict, or null if the
+// baseline couldn't be evaluated. Only called on the failure path, so its cost
+// (a second install/test) is never paid when tests pass.
+async function baseTestGate(job, repoDir, baseSha) {
+  const baseDir = `${repoDir}-base`;
+  const add = await exec("git", ["worktree", "add", "--detach", "--force", baseDir, baseSha], {
+    cwd: repoDir,
+    timeoutMs: GIT_TIMEOUT_MS,
+  });
+  if (add.code !== 0) return null;
+  try {
+    return await runTestGate(baseDir);
+  } finally {
+    await exec("git", ["worktree", "remove", "--force", baseDir], { cwd: repoDir }).catch(() => {});
+    await rm(baseDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function ensureTestsPass(job, repoDir, baseSha) {
   let gate = await runTestGate(repoDir);
   step(job.runId, "test:done", { ran: gate.ran, passed: gate.passed ?? null, projectType: gate.projectType });
+
+  // Tests failed — but before blaming the agent (fix loop + draft PR), check if the
+  // base was already failing. A pre-existing / sandbox-environment failure (e.g. a
+  // monorepo whose suite needs extra setup) shouldn't force the agent's clean change
+  // into a draft or waste fix attempts on unrelated tests.
+  if (gate.ran === true && gate.passed === false && baseSha) {
+    const base = await baseTestGate(job, repoDir, baseSha);
+    if (base && base.ran === true && base.passed === false) {
+      step(job.runId, "test:preexisting", { projectType: gate.projectType });
+      return { ...gate, preexisting: true };
+    }
+  }
+
   let attempt = 0;
   while (gate.ran === true && gate.passed === false && attempt < MAX_FIX_ATTEMPTS) {
     attempt += 1;
@@ -720,6 +755,9 @@ async function handleRunInner(rawBody) {
     // Record the actual default branch we landed on (used as PR base + diff base).
     const headRef = await exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir });
     baseBranch = (headRef.stdout || "").trim() || baseBranch;
+    // Base commit (before any agent change) — used to check whether a failing test
+    // suite was already broken on the base, so we don't blame the agent for it.
+    const baseSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
     step(job.runId, "clone:done", { baseBranch });
     const pushUrl = cloneUrlFor(activeToken);
 
@@ -790,8 +828,11 @@ async function handleRunInner(rawBody) {
     // Test gate WITH a fix loop: re-run the agent on failures until the suite
     // passes or we hit the attempt cap. Only a still-failing suite opens a draft.
     step(job.runId, "test:start");
-    const gate = await ensureTestsPass(job, repoDir);
-    const draft = gate.ran === true && gate.passed === false;
+    const gate = await ensureTestsPass(job, repoDir, baseSha);
+    // Draft only when the agent's change actually breaks a previously-green suite.
+    // A suite that was already failing on the base (gate.preexisting) opens a normal
+    // PR — the change isn't to blame — though tryMerge still won't auto-merge it.
+    const draft = gate.ran === true && gate.passed === false && !gate.preexisting;
 
     // NOTE: the branch was just created from the freshly-cloned base, so it can't
     // conflict at open time. Conflict resolution (which needs full history) happens
