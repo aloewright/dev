@@ -15,6 +15,7 @@ import {
   PasswordInput,
   Select,
   SimpleGrid,
+  Skeleton,
   Stack,
   Text,
   TextInput,
@@ -25,6 +26,7 @@ import {
   Modal,
 } from "@mantine/core";
 import { IconDots, IconEdit, IconTrash, IconRefresh } from "@tabler/icons-react";
+import { Link } from "@tanstack/react-router";
 import { fetchJson } from "@/lib/api";
 
 type Provider = "github" | "linear";
@@ -358,6 +360,31 @@ export function App() {
           </Alert>
         ) : null}
 
+        {overviewQuery.isError && !overview ? (
+          <Alert
+            color="red"
+            variant="light"
+            title="Couldn't load your dashboard"
+            mb="md"
+          >
+            <Stack gap="sm" align="flex-start">
+              <Text size="sm">{(overviewQuery.error as Error)?.message ?? "Request failed"}</Text>
+              <Button
+                size="xs"
+                variant="light"
+                color="red"
+                loading={overviewQuery.isFetching}
+                onClick={() => void overviewQuery.refetch()}
+              >
+                Try again
+              </Button>
+            </Stack>
+          </Alert>
+        ) : null}
+
+        {!overview && overviewQuery.isLoading ? <DashboardSkeleton /> : null}
+
+        {overview ? (
         <SimpleGrid cols={{ base: 1, xl: 2 }} spacing="lg">
           <Stack gap="lg">
             <SimpleGrid cols={{ base: 2, lg: 4 }} spacing="md">
@@ -397,11 +424,7 @@ export function App() {
                   />
                   <Group justify="space-between">
                     <Text c="dimmed" size="sm">
-                      {taskMutation.data
-                        ? `${taskMutation.data.id} · ${taskMutation.data.status}`
-                        : taskMutation.error
-                          ? taskMutation.error.message
-                          : "Manual approval required before sandbox execution"}
+                      Manual approval required before sandbox execution
                     </Text>
                     <Button
                       type="submit"
@@ -413,6 +436,36 @@ export function App() {
                   </Group>
                 </Stack>
               </form>
+
+              {taskMutation.isSuccess && taskMutation.data ? (
+                <Alert color="teal" variant="light" mt="md" title="Task queued">
+                  <Stack gap="xs" align="flex-start">
+                    <Text size="sm">
+                      <Text span ff="monospace">{taskMutation.data.id}</Text>
+                      {" · "}
+                      {taskMutation.data.status}
+                      {taskMutation.data.approvalRequired
+                        ? " — waiting for your approval before it runs."
+                        : " — starting now."}
+                    </Text>
+                    <Button
+                      component={Link}
+                      to="/command-center"
+                      size="xs"
+                      variant="light"
+                      color="teal"
+                    >
+                      View in Command Center
+                    </Button>
+                  </Stack>
+                </Alert>
+              ) : null}
+
+              {taskMutation.isError ? (
+                <Alert color="red" variant="light" mt="md" title="Couldn't queue task">
+                  <Text size="sm">{(taskMutation.error as Error).message}</Text>
+                </Alert>
+              ) : null}
             </Card>
 
             <Card withBorder radius="md" padding={0}>
@@ -649,8 +702,30 @@ export function App() {
             </Card>
           </Stack>
         </SimpleGrid>
+        ) : null}
       </Container>
     </Box>
+  );
+}
+
+function DashboardSkeleton() {
+  return (
+    <SimpleGrid cols={{ base: 1, xl: 2 }} spacing="lg">
+      <Stack gap="lg">
+        <SimpleGrid cols={{ base: 2, lg: 4 }} spacing="md">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} height={72} radius="md" />
+          ))}
+        </SimpleGrid>
+        <Skeleton height={220} radius="md" />
+        <Skeleton height={260} radius="md" />
+      </Stack>
+      <Stack gap="lg">
+        <Skeleton height={180} radius="md" />
+        <Skeleton height={200} radius="md" />
+        <Skeleton height={160} radius="md" />
+      </Stack>
+    </SimpleGrid>
   );
 }
 

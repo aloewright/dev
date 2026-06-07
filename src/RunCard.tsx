@@ -14,9 +14,20 @@ const STATUS_COLOR: Record<string, string> = {
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
+// Connection state of the live log stream, surfaced so a dropped stream reads as
+// "reconnecting" rather than silently freezing the output.
+type Conn = "connecting" | "live" | "reconnecting" | "ended";
+const CONN_META: Record<Conn, { color: string; label: string }> = {
+  connecting: { color: "gray", label: "connecting" },
+  live: { color: "teal", label: "live" },
+  reconnecting: { color: "yellow", label: "reconnecting…" },
+  ended: { color: "gray", label: "stream ended" },
+};
+
 export function RunCard({ run, onFinished }: { run: ActiveRun; onFinished?: (id: string) => void }) {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [status, setStatus] = useState(run.status);
+  const [conn, setConn] = useState<Conn>("connecting");
   const viewport = useRef<HTMLDivElement>(null);
   const qc = useQueryClient();
 
@@ -24,6 +35,12 @@ export function RunCard({ run, onFinished }: { run: ActiveRun; onFinished?: (id:
     const isLocal = typeof window !== "undefined" && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname);
     const url = `/api/runs/${run.id}/events/stream${isLocal ? "?x-fly-user=local-dev" : ""}`;
     const es = new EventSource(url, { withCredentials: true });
+    let ended = false;
+    es.onopen = () => setConn("live");
+    es.onerror = () => {
+      // EventSource auto-reconnects on transient errors unless it has closed.
+      if (!ended) setConn(es.readyState === EventSource.CLOSED ? "ended" : "reconnecting");
+    };
     es.addEventListener("run_event", (e) => {
       const row = JSON.parse((e as MessageEvent).data) as RunEvent;
       setEvents((prev) => [...prev.slice(-199), row]);
@@ -35,10 +52,15 @@ export function RunCard({ run, onFinished }: { run: ActiveRun; onFinished?: (id:
       if (TERMINAL.has(next)) onFinished?.(run.id);
     });
     es.addEventListener("done", () => {
+      ended = true;
+      setConn("ended");
       es.close();
       onFinished?.(run.id);
     });
-    return () => es.close();
+    return () => {
+      ended = true;
+      es.close();
+    };
   }, [run.id, onFinished]);
 
   useEffect(() => {
@@ -54,12 +76,27 @@ export function RunCard({ run, onFinished }: { run: ActiveRun; onFinished?: (id:
     <Card withBorder padding="sm" radius="md">
       <Group justify="space-between" mb="xs" wrap="nowrap">
         <Text fw={600} truncate>{run.objective}</Text>
-        <Badge color={STATUS_COLOR[status] ?? "gray"}>{status}</Badge>
+        <Group gap={6} wrap="nowrap">
+          {!TERMINAL.has(status) && (
+            <Badge size="sm" variant="dot" color={CONN_META[conn].color}>
+              {CONN_META[conn].label}
+            </Badge>
+          )}
+          <Badge color={STATUS_COLOR[status] ?? "gray"}>{status}</Badge>
+        </Group>
       </Group>
       {run.projectName && <Text size="xs" c="dimmed" mb="xs">{run.projectName}</Text>}
       <ScrollArea h={200} viewportRef={viewport} mb="xs">
         <Box style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, background: "#0d1117", padding: 8, borderRadius: 6 }}>
-          {events.length === 0 && <Text size="xs" c="dimmed">Waiting for live output…</Text>}
+          {events.length === 0 && (
+            <Text size="xs" c="dimmed">
+              {conn === "reconnecting"
+                ? "Stream dropped — reconnecting…"
+                : conn === "ended"
+                  ? "Stream ended before any output."
+                  : "Waiting for live output…"}
+            </Text>
+          )}
           {events.map((ev) => (
             <div key={ev.id} style={{ color: eventColor(ev.eventType), whiteSpace: "pre-wrap" }}>
               <span style={{ opacity: 0.6 }}>{ev.eventType}</span> {ev.message}
