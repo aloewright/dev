@@ -557,7 +557,10 @@ async function cloneWithRetry(runId, tokens, cloneUrlFor, repoDir, gitArgs) {
       const c = classifyCloneError(clone.stderr);
       if (c === "clone_transient_failed") sawTransient = true;
       else if (c !== "clone_auth_failed") sawOther = true;
-      step(runId, "clone:retry", { code: clone.code, attempt, errorClass: c });
+      // Per-token reason (last stderr line) so the failure mode (TLS drop vs auth
+      // vs not-found) is visible per credential, not just the aggregate verdict.
+      const reason = (clone.stderr || "").split("\n").map((l) => l.trim()).filter(Boolean).slice(-1)[0];
+      step(runId, "clone:retry", { code: clone.code, attempt, errorClass: c, reason });
       await rm(repoDir, { recursive: true, force: true }).catch(() => {});
     }
     errorClass = sawTransient ? "clone_transient_failed" : sawOther ? "clone_failed" : "clone_auth_failed";

@@ -16,12 +16,14 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 # Git-over-HTTPS hardening for the sandbox's egress path. Debian git links
-# libcurl3-gnutls; HTTP/2 multiplexing through the container egress was
-# terminating clones mid-stream with "GnuTLS recv error (-110): The TLS
-# connection was non-properly terminated" (observed failing 3/3 retries on
-# every run). Force HTTP/1.1 and enlarge the buffer system-wide so clone/fetch/
-# push are resilient regardless of which user runs git.
+# libcurl3-gnutls, whose TLS 1.3 handshakes through the container egress are
+# terminated mid-clone with "GnuTLS recv error (-110): The TLS connection was
+# non-properly terminated" (confirmed via per-token logging: the clone fails on
+# TLS, not auth — the PAT is valid). Pinning TLS 1.2 + HTTP/1.1 sidesteps the
+# gnutls/TLS1.3 + middlebox interaction; the buffer/low-speed settings keep
+# large clone/fetch/push resilient. Applied system-wide so any user's git uses it.
 RUN git config --system http.version HTTP/1.1 \
+  && git config --system http.sslVersion tlsv1.2 \
   && git config --system http.postBuffer 524288000 \
   && git config --system http.lowSpeedLimit 1000 \
   && git config --system http.lowSpeedTime 60
