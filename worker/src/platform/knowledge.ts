@@ -40,13 +40,15 @@ async function extractText(env: Env, file: File): Promise<{ text: string; via: s
   }
   if (type.startsWith("image/") || /\.(png|jpe?g)$/.test(name)) {
     // Vision OCR/caption via the AI binding so an image becomes searchable text.
+    // llama-3.2-11b-vision transcribes text accurately (verified) — llava-1.5-7b
+    // hallucinated and is unusable for a knowledge base.
     const bytes = [...new Uint8Array(await file.arrayBuffer())];
     const raw = await (env.AI as unknown as { run: (m: string, i: unknown, o: { gateway: { id: string } }) => Promise<unknown> }).run(
-      "@cf/llava-hf/llava-1.5-7b-hf",
+      "@cf/meta/llama-3.2-11b-vision-instruct",
       { image: bytes, prompt: "Transcribe all text in this image verbatim, then briefly describe it for a knowledge base.", max_tokens: 1024 },
       { gateway: { id: env.AI_GATEWAY_ID || "x" } },
     );
-    const desc = (raw as { description?: string; response?: string })?.description ?? (raw as { response?: string })?.response ?? "";
+    const desc = (raw as { description?: string; response?: string })?.response ?? (raw as { description?: string })?.description ?? "";
     return { text: desc, via: "image-ocr" };
   }
   throw new Error(`Unsupported file type: ${file.type || file.name}`);
