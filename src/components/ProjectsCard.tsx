@@ -9,6 +9,7 @@ import {
   Card,
   Group,
   Loader,
+  SegmentedControl,
   Select,
   Stack,
   Text,
@@ -17,6 +18,7 @@ import {
 } from "@mantine/core";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { fetchJson } from "@/lib/api";
+import { AGENT_PROVIDER_OPTIONS, type AgentProvider } from "@/lib/agentProviders";
 import { PRIORITY_LABELS, rowBorder, sectionHeader } from "@/lib/dashboard";
 import { EmptyRow, StatusBadge } from "@/components/primitives";
 import type { ContinueResult, LinearIssue, Project, Repo } from "@/types";
@@ -87,11 +89,13 @@ function ProjectRow({ project, repos }: { project: Project; repos: Repo[] }) {
   });
 
   const [confirming, setConfirming] = useState(false);
+  const [agentProvider, setAgentProvider] = useState<AgentProvider>("claude-code");
   const continueMutation = useMutation({
     mutationFn: () =>
       fetchJson<ContinueResult>(`/api/projects/${project.id}/continue`, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentProvider }),
       }),
     onSuccess: () => {
       setConfirming(false);
@@ -169,6 +173,12 @@ function ProjectRow({ project, repos }: { project: Project; repos: Repo[] }) {
           </Group>
 
           <Group gap="xs" align="center" pb="xs" wrap="wrap">
+            <SegmentedControl
+              size="xs"
+              data={AGENT_PROVIDER_OPTIONS}
+              value={agentProvider}
+              onChange={(value) => setAgentProvider(value as AgentProvider)}
+            />
             {confirming ? (
               <>
                 <Text size="xs" c="dimmed">

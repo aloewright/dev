@@ -1,9 +1,10 @@
 /* AGPL-3.0-or-later */
 import { FormEvent, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Alert, Anchor, Badge, Button, Card, Group, Select, Stack, Text, Textarea, Title } from "@mantine/core";
+import { Alert, Anchor, Badge, Button, Card, Group, SegmentedControl, Select, Stack, Text, Textarea, Title } from "@mantine/core";
 import { Link } from "@tanstack/react-router";
 import { fetchJson } from "@/lib/api";
+import { AGENT_PROVIDER_OPTIONS, AGENT_PROVIDER_SUMMARY, type AgentProvider } from "@/lib/agentProviders";
 import type { Project } from "@/types";
 
 type Workflow = { id: string; name: string; template: string };
@@ -20,6 +21,7 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
   const queryClient = useQueryClient();
   const [objective, setObjective] = useState("");
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [agentProvider, setAgentProvider] = useState<AgentProvider>("claude-code");
   const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => fetchJson<{ workflows: Workflow[] }>("/api/workflows") });
   const workflows = workflowsQuery.data?.workflows ?? [];
 
@@ -31,7 +33,7 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
   const repoMapped = Boolean(selectedProject?.repoUrl);
 
   const goalMutation = useMutation({
-    mutationFn: (payload: { objective: string; linearProjectId: string }) =>
+    mutationFn: (payload: { objective: string; linearProjectId: string; agentProvider: AgentProvider }) =>
       fetchJson<GoalResult>("/api/goals", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -47,7 +49,7 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedProject) return;
-    goalMutation.mutate({ objective, linearProjectId: selectedProject.id });
+    goalMutation.mutate({ objective, linearProjectId: selectedProject.id, agentProvider });
   }
 
   const result = goalMutation.data;
@@ -106,9 +108,23 @@ export function GoalIntakeCard({ projects }: { projects: Project[] }) {
             onChange={(event) => setObjective(event.currentTarget.value)}
             placeholder="e.g. Add SSO login with Google and GitHub, including tests and docs"
           />
+          <Stack gap={4}>
+            <Text size="sm" fw={500}>
+              Agent
+            </Text>
+            <SegmentedControl
+              data={AGENT_PROVIDER_OPTIONS}
+              value={agentProvider}
+              onChange={(value) => setAgentProvider(value as AgentProvider)}
+              fullWidth
+            />
+            <Text size="xs" c="dimmed">
+              {AGENT_PROVIDER_SUMMARY[agentProvider]}
+            </Text>
+          </Stack>
           <Group justify="space-between">
             <Text c="dimmed" size="sm">
-              Runs execute autonomously on Claude Code (Gemma failover on usage limit)
+              Runs execute autonomously with the selected agent.
             </Text>
             <Button
               type="submit"

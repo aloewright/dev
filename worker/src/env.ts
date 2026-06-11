@@ -112,6 +112,8 @@ export type Env = {
   CLOUDFLARE_API_TOKEN?: string;
   CF_AIG_TOKEN?: string;
   CLAUDE_CODE_OAUTH_TOKEN?: string;
+  CODEX_GATEWAY_MODEL?: string;
+  CLOUDFLARE_GATEWAY_MODEL?: string;
   // Continue flow. CONTINUE_AUTONOMY="true" lets the Continue button auto-approve
   // runs, bypassing REQUIRE_HUMAN_APPROVAL (operator opt-in). CONTINUE_EXECUTE_CAP
   // caps how many runs one Continue click starts. Both are non-secret vars.

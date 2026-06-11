@@ -5,7 +5,7 @@ import { redactSecrets } from "./crypto";
 import { getLinearProjectIssues, getValidLinearToken } from "./integrations";
 import { planGoal, type ProjectContext } from "./planner";
 import { createLinearIssue, resolveProjectTeam, type CreatedLinearIssue } from "./linear";
-import { createAutonomousRun } from "./orchestration";
+import { createAutonomousRun, type AgentProvider } from "./orchestration";
 import { activeRepo, executeCap } from "./continue";
 import { getCore, buildCorePreamble } from "./core";
 
@@ -25,7 +25,7 @@ export type GoalResult = {
 export async function runGoal(
   env: Env,
   user: CurrentUser,
-  payload: { objective?: string; linearProjectId?: string },
+  payload: { objective?: string; linearProjectId?: string; agentProvider?: AgentProvider },
 ): Promise<Response> {
   const objective = redactSecrets((payload.objective ?? "").trim());
   if (objective.length < 4) {
@@ -125,7 +125,7 @@ export async function runGoal(
       linearIssueId: issue.id,
       linearTeamId: teamId,
       goalId,
-      agentProvider: "claude-code",
+      agentProvider: payload.agentProvider ?? "claude-code",
       source: "goal",
     }).catch(() => null);
     if (run && run.status === "queued") queuedRuns.push({ id: run.id, issue: issue.identifier });

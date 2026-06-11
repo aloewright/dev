@@ -14,6 +14,11 @@ import path from "node:path";
 import { createHmac } from "node:crypto";
 import { createThrottle } from "./event-throttle.mjs";
 import { classifyAgentFailure } from "./agent-failure.mjs";
+import {
+  buildCodexGatewayEnv,
+  DEFAULT_CLOUDFLARE_GATEWAY_MODEL,
+  DEFAULT_CODEX_GATEWAY_MODEL,
+} from "./codex-gateway.mjs";
 
 // Per-run live callback config, set at the start of handleRun.
 let callback = null; // { baseUrl, secret, runId }
@@ -135,28 +140,24 @@ function exec(cmd, args, opts = {}) {
 // (`claude setup-token`) that bills against the user's Pro/Max subscription —
 // gateway routing does not apply to OAuth/subscription auth. codex (OpenAI-
 // compatible) still routes through Cloudflare AI Gateway when available.
+function codexGateway(job) {
+  return job.codexGateway ?? job.aiGateway ?? job.codexFallback ?? null;
+}
+
+function cloudflareGateway(job) {
+  return job.cloudflareGateway ?? null;
+}
+
+function gatewayForProvider(job, provider) {
+  return provider === "cloudflare" ? cloudflareGateway(job) : codexGateway(job);
+}
+
 function buildAgentEnv(job, provider) {
   const env = { HOME: "/tmp", IS_SANDBOX: "1" };
   if (job.linearToken) env.LINEAR_API_KEY = job.linearToken;
 
-  if (provider === "codex") {
-    const gw = job.aiGateway;
-    if (gw?.url) {
-      env.OPENAI_BASE_URL = gw.url;
-      if (gw.token) env.OPENAI_API_KEY = gw.token;
-    }
-    return env;
-  }
-
-  // gemma: failover agent. Runs the OpenAI-compatible CLI (codex) against the AI
-  // Gateway's /compat endpoint using a Workers AI Gemma model — used when
-  // claude-code reports a subscription usage limit.
-  if (provider === "gemma") {
-    const gw = job.gemmaFallback;
-    if (gw?.url) {
-      env.OPENAI_BASE_URL = gw.url;
-      if (gw.token) env.OPENAI_API_KEY = gw.token;
-    }
+  if (provider === "codex" || provider === "cloudflare") {
+    Object.assign(env, buildCodexGatewayEnv(job, gatewayForProvider(job, provider)) ?? {});
     return env;
   }
 
@@ -168,12 +169,22 @@ function buildAgentEnv(job, provider) {
 }
 
 function agentCommand(job, prompt, provider) {
-  if (provider === "codex") {
-    return { cmd: "codex", args: ["exec", "--full-auto", prompt] };
-  }
-  if (provider === "gemma") {
-    const model = job.gemmaFallback?.model || "@cf/google/gemma-4-26b-a4b-it";
-    return { cmd: "codex", args: ["exec", "--full-auto", "--model", model, prompt] };
+  if (provider === "codex" || provider === "cloudflare") {
+    const fallbackModel =
+      provider === "cloudflare" ? DEFAULT_CLOUDFLARE_GATEWAY_MODEL : DEFAULT_CODEX_GATEWAY_MODEL;
+    const model = gatewayForProvider(job, provider)?.model || fallbackModel;
+    return {
+      cmd: "codex",
+      args: [
+        "exec",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--model",
+        model,
+        prompt,
+      ],
+    };
   }
   return {
     cmd: "claude",
@@ -197,16 +208,16 @@ async function runOnce(job, repoDir, prompt, provider) {
 }
 
 // Run the coding agent. If the primary is claude-code and it hits a subscription
-// usage limit, fail over to Gemma via the AI Gateway (when configured) and re-run
-// the same prompt. The returned result is annotated with `failover` so the caller
-// can log it. Falling over is best-effort: if Gemma isn't configured, the original
-// (limit) result is returned unchanged.
+// usage limit, fail over to Codex through the AI Gateway (when configured) and
+// re-run the same prompt. The returned result is annotated with `failover` so the
+// caller can log it. Falling over is best-effort: if Codex isn't configured, the
+// original (limit) result is returned unchanged.
 async function runAgent(job, repoDir, prompt) {
   const provider = job.agentProvider || "claude-code";
   const primary = await runOnce(job, repoDir, prompt, provider);
-  if (provider === "claude-code" && job.gemmaFallback?.url && isClaudeUsageLimit(primary)) {
-    const fb = await runOnce(job, repoDir, prompt, "gemma");
-    fb.failover = "claude_usage_limit->gemma";
+  if (provider === "claude-code" && codexGateway(job)?.url && isClaudeUsageLimit(primary)) {
+    const fb = await runOnce(job, repoDir, prompt, "codex");
+    fb.failover = "claude_usage_limit->codex";
     return fb;
   }
   return primary;
@@ -774,7 +785,7 @@ async function handleRunInner(rawBody) {
       : job.objective;
     const agent = await runAgent(job, repoDir, prompt);
     if (agent.failover) {
-      step(job.runId, "agent:failover", { reason: agent.failover, model: job.gemmaFallback?.model });
+      step(job.runId, "agent:failover", { reason: agent.failover, model: codexGateway(job)?.model });
     }
     step(job.runId, "agent:done", { exitCode: agent.code, ms: Date.now() - agentStartedAt });
     const summary = (agent.stdout || "").slice(-4000);

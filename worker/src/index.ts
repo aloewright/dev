@@ -276,7 +276,7 @@ async function streamAi(
 // Different models stream their visible output in different delta fields:
 //   gpt-oss-120b (binding route): `delta.reasoning_content` (internal trace,
 //     useful for debugging) then `delta.content` (final answer).
-//   gemma via dynamic route:      `delta.reasoning` is the *only* output
+//   some dynamic routes:          `delta.reasoning` is the *only* output
 //     channel — there's no separate `delta.content`.
 // Pick whichever non-null text channel a chunk carries and tag it with `kind`
 // so the consumer can filter (`kind === "content"` for clean OpenAI output,
@@ -528,7 +528,8 @@ app.get("/api/projects/:id/issues", async (c) => {
 app.post("/api/projects/:id/continue", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
-  return continueProject(c.env, user, c.req.param("id"));
+  const payload = await c.req.json().catch(() => ({}));
+  return continueProject(c.env, user, c.req.param("id"), payload as { agentProvider?: "claude-code" | "codex" | "cloudflare" });
 });
 
 // Auto-map all Linear projects to GitHub repos by name (confident matches become
@@ -664,7 +665,7 @@ app.post("/api/goals", async (c) => {
   if (!payload || typeof payload !== "object") {
     return c.json({ error: "Invalid JSON body" }, 400);
   }
-  return runGoal(c.env, user, payload as { objective?: string; linearProjectId?: string });
+  return runGoal(c.env, user, payload as { objective?: string; linearProjectId?: string; agentProvider?: "claude-code" | "codex" | "cloudflare" });
 });
 
 app.get("/api/goals", async (c) => {
@@ -1444,8 +1445,8 @@ export class RunWorkflow extends WorkflowEntrypoint<Env, RunWorkflowParams> {
             githubToken: creds.githubToken,
             githubTokens: creds.githubTokens,
             linearToken: creds.linearToken,
-            aiGateway: creds.aiGateway,
-            gemmaFallback: creds.gemmaFallback,
+            codexGateway: creds.codexGateway,
+            cloudflareGateway: creds.cloudflareGateway,
             claudeOauthToken: creds.claudeOauthToken,
             callbackBaseUrl: this.env.APP_URL,
             callbackSecret: this.env.INTERNAL_API_SECRET ?? "",

@@ -15,7 +15,13 @@ export function Metric({ label, value }: { label: string; value: string | number
 }
 
 export function StatusBadge({ status }: { status: string }) {
-  const normalized = status.replaceAll("_", " ");
+  const normalized = (
+    {
+      "claude-code": "Claude",
+      codex: "Codex",
+      cloudflare: "Cloudflare",
+    } as Record<string, string>
+  )[status] ?? status.replaceAll("_", " ");
   const color =
     status.includes("failed") || status.includes("error")
       ? "red"
