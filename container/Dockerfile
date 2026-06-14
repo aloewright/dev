@@ -83,7 +83,7 @@ RUN useradd --system --create-home --home-dir /home/sandbox sandbox \
 # server.mjs imports these sibling modules at runtime; they MUST be in the image or
 # the container crashes at boot (ERR_MODULE_NOT_FOUND) and never binds port 8080.
 # Do NOT copy *.test.mjs (they import vitest, which isn't installed in the image).
-COPY --chown=sandbox:sandbox server.mjs event-throttle.mjs agent-failure.mjs /app/
+COPY --chown=sandbox:sandbox server.mjs event-throttle.mjs agent-failure.mjs codex-gateway.mjs /app/
 
 USER sandbox
 WORKDIR /home/sandbox

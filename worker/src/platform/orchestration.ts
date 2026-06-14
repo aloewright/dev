@@ -5,6 +5,14 @@ import { redactSecrets } from "./crypto";
 import { getDecryptedToken, getValidLinearToken } from "./integrations";
 import { getInstallationToken } from "./github";
 
+export type AgentProvider = "claude-code" | "codex" | "cloudflare";
+
+function normalizeAgentProvider(provider: unknown): AgentProvider {
+  return provider === "codex" || provider === "cloudflare" || provider === "claude-code"
+    ? provider
+    : "claude-code";
+}
+
 export type CreateTaskPayload = {
   objective?: string;
   goal?: string;
@@ -17,7 +25,7 @@ export type CreateTaskPayload = {
   // Groups runs created from one decomposed goal (see goal.ts). Stored in
   // metadata_json so runs can be queried back per goal without a hot-path column.
   goalId?: string;
-  agentProvider?: "codex" | "claude-code";
+  agentProvider?: AgentProvider;
   autonomyMode?: "manual_approval" | "auto_review" | "auto_eligible";
   source?: string;
   // "address_pr" runs check out an existing PR (prNumber) and address its review
@@ -75,7 +83,7 @@ export async function createTaskRun(env: Env, user: CurrentUser, payload: Create
       objective,
       status,
       payload.autonomyMode ?? "manual_approval",
-      payload.agentProvider ?? "claude-code",
+      normalizeAgentProvider(payload.agentProvider),
       approvalRequired,
       payload.linearIssueId ?? null,
       payload.linearTeamId ?? null,
@@ -418,8 +426,8 @@ export async function prepareRunCredentials(
   githubToken: string | null;
   githubTokens: string[];
   linearToken: string | null;
-  aiGateway: { url: string; token: string } | null;
-  gemmaFallback: { url: string; token: string; model: string } | null;
+  codexGateway: { url: string; token: string; gatewayId: string; model: string } | null;
+  cloudflareGateway: { url: string; token: string; gatewayId: string; model: string } | null;
   claudeOauthToken: string | null;
 }> {
   const oauthToken = await getDecryptedToken(env, plan.userId, "github");
@@ -444,35 +452,36 @@ export async function prepareRunCredentials(
 
   const linearToken = await getValidLinearToken(env, plan.userId);
 
-  // For codex (OpenAI-compatible Messages API), keep gateway routing so calls
-  // are observed + cost-tracked centrally.
-  const aiGateway =
-    env.CF_AIG_TOKEN && env.CLOUDFLARE_ACCOUNT_ID
-      ? {
-          url: `https://gateway.ai.cloudflare.com/v1/${env.CLOUDFLARE_ACCOUNT_ID}/${env.AI_GATEWAY_ID || "x"}/anthropic`,
-          token: env.CF_AIG_TOKEN,
-        }
-      : null;
-
   // For claude-code we bypass the gateway entirely: a long-lived OAuth token
   // (`claude setup-token`) bills against the user's Claude Pro/Max subscription
   // — the gateway only proxies API-key auth, not OAuth/subscription auth.
   const claudeOauthToken = env.CLAUDE_CODE_OAUTH_TOKEN ?? null;
 
-  // Failover agent: when claude-code hits its subscription usage limit, the
-  // container re-runs the job through the AI Gateway's OpenAI-compatible endpoint
-  // using Gemma (a Workers AI model that's always available and gateway-routed).
-  // base = .../compat; the OpenAI client appends /chat/completions.
-  const gemmaFallback =
+  // Codex 0.139+ requires the Responses API. Cloudflare dynamic/* routes are
+  // still chat-completions-only today, so the Claude -> Codex -> AI Gateway
+  // failover uses AI Gateway's REST Responses endpoint with a Codex-capable
+  // OpenAI model. Switch CODEX_GATEWAY_MODEL back to a dynamic/* slug once
+  // Cloudflare exposes Responses support for dynamic routes.
+  const codexGateway =
     env.CF_AIG_TOKEN && env.CLOUDFLARE_ACCOUNT_ID
       ? {
-          url: `https://gateway.ai.cloudflare.com/v1/${env.CLOUDFLARE_ACCOUNT_ID}/${env.AI_GATEWAY_ID || "x"}/compat`,
+          url: `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
           token: env.CF_AIG_TOKEN,
-          model: "@cf/google/gemma-4-26b-a4b-it",
+          gatewayId: env.AI_GATEWAY_ID || "x",
+          model: env.CODEX_GATEWAY_MODEL || "openai/gpt-5.5",
+        }
+      : null;
+  const cloudflareGateway =
+    env.CF_AIG_TOKEN && env.CLOUDFLARE_ACCOUNT_ID
+      ? {
+          url: `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
+          token: env.CF_AIG_TOKEN,
+          gatewayId: env.AI_GATEWAY_ID || "x",
+          model: env.CLOUDFLARE_GATEWAY_MODEL || "@cf/openai/gpt-oss-120b",
         }
       : null;
 
-  return { githubToken, githubTokens, linearToken, aiGateway, gemmaFallback, claudeOauthToken };
+  return { githubToken, githubTokens, linearToken, codexGateway, cloudflareGateway, claudeOauthToken };
 }
 
 async function resolveRepoCoords(

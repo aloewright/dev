@@ -4,7 +4,7 @@ import { first } from "./data";
 import { autoMapProjects, getLinearProjectIssues, getValidLinearToken } from "./integrations";
 import { planNextSteps, type ProjectContext } from "./planner";
 import { createLinearIssue, resolveProjectTeam, type CreatedLinearIssue } from "./linear";
-import { createAutonomousRun } from "./orchestration";
+import { createAutonomousRun, type AgentProvider } from "./orchestration";
 
 const DEFAULT_EXECUTE_CAP = 3;
 const MAX_EXECUTE_CAP = 10; // hard ceiling so a misconfigured env var can't start a flood of runs
@@ -38,7 +38,12 @@ export function selectExecuteTargets(
   return pool.slice(0, Math.max(0, cap));
 }
 
-export async function continueProject(env: Env, user: CurrentUser, projectId: string): Promise<Response> {
+export async function continueProject(
+  env: Env,
+  user: CurrentUser,
+  projectId: string,
+  options: { agentProvider?: AgentProvider } = {},
+): Promise<Response> {
   // 1. Review: project + repo mapping + open issues.
   const project = await first<{
     id: string;
@@ -128,7 +133,7 @@ export async function continueProject(env: Env, user: CurrentUser, projectId: st
       linearProjectId: projectId,
       linearIssueId: target.issue.id,
       linearTeamId: teamId,
-      agentProvider: "claude-code",
+      agentProvider: options.agentProvider ?? "claude-code",
       source: "continue",
     }).catch(() => null);
     // Only count runs that actually queued. With CONTINUE_AUTONOMY off, the run is
