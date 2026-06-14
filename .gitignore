@@ -18,3 +18,7 @@ verification/
 .dev.vars
 .dev.vars.*
 infra/hindsight-monitor/worker-configuration.d.ts
+
+# this repo uses bun (bun.lock is authoritative; Workers Builds runs `bun install --frozen-lockfile`).
+# npm's lockfile drifts from bun.lock and is used by no CI — keep it untracked.
+package-lock.json
