@@ -120,7 +120,7 @@ async function handleStats(env) {
     },
     llm: llmRows,
     deployment: {
-      host: "GCE e2-medium · us-central1 (pdx-software)",
+      host: "iMac 2020 (Retina 5K, 27-inch) · 192.168.1.188",
       reach: "cloudflared tunnel + Cloudflare Access",
       embeddings: "local BGE (on-box, no gateway)",
       chat: "Cloudflare AI Gateway — dynamic/text_gen (+ dynamic/research_gen for reflect)",

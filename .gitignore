@@ -13,3 +13,8 @@ verification/
 # local scratch (claude)
 .probes.*
 *.scratch
+
+# secrets / generated (never commit)
+.dev.vars
+.dev.vars.*
+infra/hindsight-monitor/worker-configuration.d.ts
