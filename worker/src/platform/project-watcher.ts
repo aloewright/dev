@@ -114,9 +114,13 @@ async function watchProject(
   activeRunCount: () => Promise<number>,
 ): Promise<void> {
   const { issues, reason } = await getLinearProjectIssues(env, userId, projectId);
-  // Return early only when the Linear token is missing. An empty issues list is
-  // valid (all done) and must still trigger the reconciliation pass below.
-  if (reason) return;
+  // Return early only when the Linear fetch reported a problem (e.g. missing/
+  // expired token, rate limit). An empty issues list with no reason is valid
+  // (all done) and must still trigger the reconciliation pass below.
+  if (reason) {
+    console.warn(`[watcher] skipping project ${projectId}: ${reason}`);
+    return;
+  }
 
   const now = new Date().toISOString();
   const returnedIds = new Set(issues.map((i) => i.id));
@@ -165,18 +169,46 @@ async function watchProject(
     "SELECT issue_id FROM issue_watch_state WHERE project_id = ?",
     [projectId],
   );
-  for (const row of existingRows) {
-    if (!returnedIds.has(row.issue_id)) {
-      await runSql(env, "DELETE FROM issue_watch_state WHERE issue_id = ?", [row.issue_id]);
-    }
+  const vanishedIds = existingRows
+    .map((row) => row.issue_id)
+    .filter((id) => !returnedIds.has(id));
+  if (vanishedIds.length > 0) {
+    // Batch the reconciliation deletes into a single statement (N writes -> 1).
+    const placeholders = vanishedIds.map(() => "?").join(",");
+    await runSql(
+      env,
+      `DELETE FROM issue_watch_state WHERE issue_id IN (${placeholders})`,
+      vanishedIds,
+    );
   }
 
-  // Fetch the repo mapping once for this project (needed for PR check).
+  // Fetch the repo mapping once for this project (needed for PR check and for
+  // resolving a run's target repository).
   const repoMapping = await first<{ owner: string; repo: string }>(
     env,
     "SELECT owner, repo FROM repository_mappings WHERE linear_project_id = ? AND status = 'active' LIMIT 1",
     [projectId],
   );
+
+  // Skip dispatch entirely for projects with no active repository mapping.
+  // resolveRunPlan can only resolve a repo from repo_mapping_id or the active
+  // mapping for linearProjectId, so a dispatched run here would immediately fail
+  // with "No repository mapped to this run". Failed runs are not counted as
+  // active, so the cron would re-dispatch the same issues every tick. The upsert
+  // and reconciliation passes above already ran, so watch state stays current.
+  if (!repoMapping) {
+    console.log(`[watcher] project ${projectId} has no active repository mapping, skipping dispatch`);
+    return;
+  }
+
+  // Bail before fetching watchRows (and before per-issue runs/GitHub queries) if
+  // the global cap was already reached by an earlier project this tick. The loop
+  // below re-checks the cap immediately before each dispatch, so this is purely
+  // an optimization to skip the per-project N+1 work once we're saturated.
+  if ((await activeRunCount()) >= MAX_CONCURRENT_RUNS) {
+    console.log(`[watcher] concurrency cap reached, skipping dispatch for project ${projectId}`);
+    return;
+  }
 
   // Apply dispatch rules to each watched issue.
   const watchRows = await all<IssueWatchRow>(
@@ -205,17 +237,26 @@ async function watchProject(
     if (
       row.state_type === "started" &&
       row.first_seen_started_at &&
-      repoMapping &&
       !hasActiveRun
     ) {
       const elapsedMs = nowMs - new Date(row.first_seen_started_at).getTime();
       if (elapsedMs >= ONE_HOUR_MS) {
-        hasMergedPr = await findMergedPrForIssue(
+        const result = await findMergedPrForIssue(
           env,
           repoMapping.owner,
           repoMapping.repo,
           row.issue_identifier,
         );
+        // null = the PR check could not be completed (transient GitHub error).
+        // Treat as UNKNOWN and skip this issue for the tick rather than assuming
+        // "no merged PR" — that would risk a false-positive takeover run.
+        if (result === null) {
+          console.warn(
+            `[watcher] GitHub PR check failed for ${row.issue_identifier}, skipping this tick`,
+          );
+          continue;
+        }
+        hasMergedPr = result;
       }
     }
 

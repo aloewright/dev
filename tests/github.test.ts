@@ -46,7 +46,7 @@ describe("findMergedPrForIssue", () => {
     expect(result).toBe(false);
   });
 
-  it("returns false when the GitHub API returns an error status", async () => {
+  it("returns null (unknown) when the GitHub API returns an error status", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({ ok: false, status: 403 }),
@@ -54,18 +54,19 @@ describe("findMergedPrForIssue", () => {
 
     const result = await findMergedPrForIssue(mockEnv, "acme", "myrepo", "FLY-1");
 
-    expect(result).toBe(false);
+    // A transient API failure is "unknown", not a definite "not merged".
+    expect(result).toBe(null);
   });
 
-  it("returns false when fetch throws", async () => {
+  it("returns null (unknown) when fetch throws", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
 
     const result = await findMergedPrForIssue(mockEnv, "acme", "myrepo", "FLY-1");
 
-    expect(result).toBe(false);
+    expect(result).toBe(null);
   });
 
-  it("returns false when no token is available", async () => {
+  it("returns null (unknown) when no token is available", async () => {
     const noTokenEnv = {
       GITHUB_APP_ID: undefined,
       GITHUB_APP_PRIVATE_KEY: undefined,
@@ -74,6 +75,6 @@ describe("findMergedPrForIssue", () => {
 
     const result = await findMergedPrForIssue(noTokenEnv, "acme", "myrepo", "FLY-1");
 
-    expect(result).toBe(false);
+    expect(result).toBe(null);
   });
 });
