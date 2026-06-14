@@ -13,9 +13,9 @@ Cloudflare-native orchestration surface for the fly.pm app family, hosted at `de
 ## Local development
 
 ```sh
-npm install
-npm run migrate:local
-npm run dev
+bun install
+bun run migrate:local
+bun run dev
 ```
 
 The Vite app runs on `127.0.0.1:5173` and proxies `/api` to the Worker on `127.0.0.1:8787`.
@@ -23,10 +23,10 @@ The Vite app runs on `127.0.0.1:5173` and proxies `/api` to the Worker on `127.0
 ## Verification
 
 ```sh
-npm run typecheck
-npm test
-npm run build
-npm run cf:dry-run
+bun run typecheck
+bun run test
+bun run build
+bun run cf:dry-run
 ```
 
 `wrangler.jsonc` contains the production D1/KV bindings created for `fly-dev`; credentials and signing keys should be set with Wrangler secrets.
