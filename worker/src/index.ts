@@ -528,8 +528,12 @@ app.get("/api/projects/:id/issues", async (c) => {
 app.post("/api/projects/:id/continue", async (c) => {
   const user = await requireUser(c.req.raw, c.env);
   if (user instanceof Response) return user;
-  const payload = await c.req.json().catch(() => ({}));
-  return continueProject(c.env, user, c.req.param("id"), payload as { agentProvider?: "claude-code" | "codex" | "cloudflare" });
+  const raw = await c.req.json().catch(() => ({}));
+  const payload =
+    raw && typeof raw === "object"
+      ? (raw as { agentProvider?: "claude-code" | "codex" | "cloudflare" })
+      : {};
+  return continueProject(c.env, user, c.req.param("id"), payload);
 });
 
 // Auto-map all Linear projects to GitHub repos by name (confident matches become
