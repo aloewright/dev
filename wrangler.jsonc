@@ -27,7 +27,7 @@
   ],
   "workers_dev": false,
   "preview_urls": false,
-  // Self-healing reaper: re-queues retryable failed / stuck runs every 5 minutes.
+  // Self-healing reaper + autonomous Linear project watcher: both run every 5 minutes.
   "triggers": {
     "crons": ["*/5 * * * *"]
   },
