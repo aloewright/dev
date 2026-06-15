@@ -65,7 +65,7 @@ import {
 } from "./platform/orchestration";
 import { writeBackToLinear } from "./platform/linear";
 import { mergeWhenGreen, deleteRepository, renameRepository } from "./platform/github";
-import { continueProject } from "./platform/continue";
+import { continueProject, executeProjectTodos } from "./platform/continue";
 import { runGoal, listGoals } from "./platform/goal";
 import { getCore, getCoreResponse, saveCore, buildCorePreamble } from "./platform/core";
 import { listWorkflows, saveWorkflow, deleteWorkflow } from "./platform/workflows";
@@ -535,6 +535,19 @@ app.post("/api/projects/:id/continue", async (c) => {
       ? (raw as { agentProvider?: "claude-code" | "codex" | "cloudflare" })
       : {};
   return continueProject(c.env, user, c.req.param("id"), payload);
+});
+
+// Manual To Do execution: fetch open Linear issues live and dispatch the backlog /
+// unstarted ones immediately, without relying on the scheduled watcher table.
+app.post("/api/projects/:id/execute-todos", async (c) => {
+  const user = await requireUser(c.req.raw, c.env);
+  if (user instanceof Response) return user;
+  const raw = await c.req.json().catch(() => ({}));
+  const payload =
+    raw && typeof raw === "object"
+      ? (raw as { agentProvider?: "claude-code" | "codex" | "cloudflare" })
+      : {};
+  return executeProjectTodos(c.env, user, c.req.param("id"), payload);
 });
 
 // Auto-map all Linear projects to GitHub repos by name (confident matches become

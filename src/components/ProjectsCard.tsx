@@ -16,12 +16,12 @@ import {
   Title,
   UnstyledButton,
 } from "@mantine/core";
-import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronRight, IconRefresh } from "@tabler/icons-react";
 import { fetchJson } from "@/lib/api";
 import { AGENT_PROVIDER_OPTIONS, type AgentProvider } from "@/lib/agentProviders";
 import { PRIORITY_LABELS, rowBorder, sectionHeader } from "@/lib/dashboard";
 import { EmptyRow, StatusBadge } from "@/components/primitives";
-import type { ContinueResult, LinearIssue, Project, Repo } from "@/types";
+import type { ContinueResult, LinearIssue, Project, Repo, TodoExecutionResult } from "@/types";
 
 export function ProjectsCard({ projects, repos }: { projects: Project[]; repos: Repo[] }) {
   const queryClient = useQueryClient();
@@ -99,6 +99,19 @@ function ProjectRow({ project, repos }: { project: Project; repos: Repo[] }) {
       }),
     onSuccess: () => {
       setConfirming(false);
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+      void queryClient.invalidateQueries({ queryKey: ["issues", project.id] });
+    },
+  });
+
+  const executeTodosMutation = useMutation({
+    mutationFn: () =>
+      fetchJson<TodoExecutionResult>(`/api/projects/${project.id}/execute-todos`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentProvider }),
+      }),
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
       void queryClient.invalidateQueries({ queryKey: ["issues", project.id] });
     },
@@ -201,11 +214,32 @@ function ProjectRow({ project, repos }: { project: Project; repos: Repo[] }) {
                 Continue ▶
               </Button>
             )}
+            <Button
+              size="xs"
+              variant="light"
+              leftSection={<IconRefresh size={14} />}
+              loading={executeTodosMutation.isPending}
+              onClick={() => executeTodosMutation.mutate()}
+            >
+              Refresh To Dos
+            </Button>
           </Group>
 
           {continueMutation.error ? (
             <Text size="xs" c="red" pb="xs" role="alert">
               {(continueMutation.error as Error).message}
+            </Text>
+          ) : null}
+
+          {executeTodosMutation.error ? (
+            <Text size="xs" c="red" pb="xs" role="alert">
+              {(executeTodosMutation.error as Error).message}
+            </Text>
+          ) : null}
+
+          {executeTodosMutation.data ? (
+            <Text size="xs" c="dimmed" pb="xs">
+              {todoExecutionSummary(executeTodosMutation.data)}
             </Text>
           ) : null}
 
@@ -297,4 +331,23 @@ function ProjectRow({ project, repos }: { project: Project; repos: Repo[] }) {
       ) : null}
     </Box>
   );
+}
+
+function todoExecutionSummary(result: TodoExecutionResult): string {
+  const queued = result.runs.filter((run) => run.status === "queued").length;
+  const waiting = result.runs.filter((run) => run.status === "waiting_approval").length;
+  const other = result.runs.length - queued - waiting;
+  const parts = [
+    queued ? `${queued} queued` : null,
+    waiting ? `${waiting} waiting approval` : null,
+    other ? `${other} created` : null,
+    result.skippedActive ? `${result.skippedActive} already active` : null,
+    result.skippedCap ? `${result.skippedCap} deferred by cap` : null,
+    result.failedRuns.length ? `${result.failedRuns.length} failed` : null,
+  ].filter(Boolean);
+
+  if (parts.length === 0) {
+    return `No To Dos queued (${result.eligibleIssues} eligible of ${result.totalOpenIssues} open).`;
+  }
+  return `${parts.join(" · ")} (${result.eligibleIssues} eligible of ${result.totalOpenIssues} open).`;
 }
