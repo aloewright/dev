@@ -334,16 +334,18 @@ function ProjectRow({ project, repos }: { project: Project; repos: Repo[] }) {
 }
 
 function todoExecutionSummary(result: TodoExecutionResult): string {
-  const queued = result.runs.filter((run) => run.status === "queued").length;
-  const waiting = result.runs.filter((run) => run.status === "waiting_approval").length;
-  const other = result.runs.length - queued - waiting;
+  const runs = result.runs ?? [];
+  const queued = runs.filter((run) => run.status === "queued").length;
+  const waiting = runs.filter((run) => run.status === "waiting_approval").length;
+  const other = runs.length - queued - waiting;
   const parts = [
     queued ? `${queued} queued` : null,
     waiting ? `${waiting} waiting approval` : null,
     other ? `${other} created` : null,
     result.skippedActive ? `${result.skippedActive} already active` : null,
     result.skippedCap ? `${result.skippedCap} deferred by cap` : null,
-    result.failedRuns.length ? `${result.failedRuns.length} failed` : null,
+    result.failedRuns?.length ? `${result.failedRuns.length} failed` : null,
+  ].filter(Boolean);
   ].filter(Boolean);
 
   if (parts.length === 0) {
