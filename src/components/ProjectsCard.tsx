@@ -346,7 +346,6 @@ function todoExecutionSummary(result: TodoExecutionResult): string {
     result.skippedCap ? `${result.skippedCap} deferred by cap` : null,
     result.failedRuns?.length ? `${result.failedRuns.length} failed` : null,
   ].filter(Boolean);
-  ].filter(Boolean);
 
   if (parts.length === 0) {
     return `No To Dos queued (${result.eligibleIssues} eligible of ${result.totalOpenIssues} open).`;
