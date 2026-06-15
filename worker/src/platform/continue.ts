@@ -1,13 +1,15 @@
 /* AGPL-3.0-or-later */
 import type { CurrentUser, Env } from "../env";
-import { first } from "./data";
+import { all, first } from "./data";
 import { autoMapProjects, getLinearProjectIssues, getValidLinearToken } from "./integrations";
+import type { LinearIssue } from "./integrations";
 import { planNextSteps, type ProjectContext } from "./planner";
 import { createLinearIssue, resolveProjectTeam, type CreatedLinearIssue } from "./linear";
 import { createAutonomousRun, type AgentProvider } from "./orchestration";
 
 const DEFAULT_EXECUTE_CAP = 3;
 const MAX_EXECUTE_CAP = 10; // hard ceiling so a misconfigured env var can't start a flood of runs
+const TODO_STATE_TYPES = new Set(["backlog", "unstarted"]);
 
 export type CreatedWithMeta = {
   planIndex: number;
@@ -23,6 +25,27 @@ export type ContinueResult = {
   skipped: number;
 };
 
+export type TodoExecutionRun = {
+  id: string;
+  issue: string;
+  status: string;
+};
+
+export type TodoExecutionResult = {
+  totalOpenIssues: number;
+  eligibleIssues: number;
+  runs: TodoExecutionRun[];
+  skippedActive: number;
+  skippedState: number;
+  skippedCap: number;
+  failedRuns: Array<{ issue: string; error: string }>;
+};
+
+type TodoCandidate = Pick<
+  LinearIssue,
+  "id" | "identifier" | "title" | "description" | "stateType" | "priority" | "updatedAt" | "teamId"
+>;
+
 // Choose which created issues to execute: prefer the planner's `execute` indexes
 // (those that actually got created), else fall back to highest priority. Capped.
 export function selectExecuteTargets(
@@ -36,6 +59,116 @@ export function selectExecuteTargets(
     pool = [...created].sort((a, b) => a.priority - b.priority); // 1=urgent first
   }
   return pool.slice(0, Math.max(0, cap));
+}
+
+export function selectTodoExecutionTargets(
+  issues: TodoCandidate[],
+  activeIssueIds: Set<string>,
+  cap: number,
+): {
+  targets: TodoCandidate[];
+  eligibleIssues: number;
+  skippedActive: number;
+  skippedState: number;
+  skippedCap: number;
+} {
+  const todoIssues = issues
+    .filter((issue) => TODO_STATE_TYPES.has(issue.stateType))
+    .sort((a, b) => {
+      const byPriority = priorityRank(a.priority) - priorityRank(b.priority);
+      if (byPriority !== 0) return byPriority;
+      const byUpdated = updatedAtMs(a.updatedAt) - updatedAtMs(b.updatedAt);
+      if (byUpdated !== 0) return byUpdated;
+      return a.identifier.localeCompare(b.identifier);
+    });
+  const available = todoIssues.filter((issue) => !activeIssueIds.has(issue.id));
+  const targetCap = Math.max(0, cap);
+  const targets = available.slice(0, targetCap);
+
+  return {
+    targets,
+    eligibleIssues: todoIssues.length,
+    skippedActive: todoIssues.length - available.length,
+    skippedState: issues.length - todoIssues.length,
+    skippedCap: Math.max(0, available.length - targets.length),
+  };
+}
+
+export async function executeProjectTodos(
+  env: Env,
+  user: CurrentUser,
+  projectId: string,
+  options: { agentProvider?: AgentProvider } = {},
+): Promise<Response> {
+  const project = await first<{ id: string }>(
+    env,
+    "SELECT id FROM linear_projects WHERE id = ?",
+    [projectId],
+  );
+  if (!project) {
+    return Response.json({ error: "Project not found" }, { status: 404 });
+  }
+
+  let repo = await activeRepo(env, projectId);
+  if (!repo) {
+    await autoMapProjects(env, user.id).catch(() => undefined);
+    repo = await activeRepo(env, projectId);
+  }
+  if (!repo) {
+    return Response.json(
+      { error: "No GitHub repo mapped to this project. Map a repo first.", needsRepo: true },
+      { status: 409 },
+    );
+  }
+
+  const { issues, reason } = await getLinearProjectIssues(env, user.id, projectId);
+  if (reason) {
+    return Response.json({ error: reason, needsReconnect: reason.includes("Linear") }, { status: 400 });
+  }
+
+  const activeRows = await all<{ linear_issue_id: string }>(
+    env,
+    `SELECT linear_issue_id
+       FROM runs
+      WHERE project_id = ?
+        AND linear_issue_id IS NOT NULL
+        AND status IN ('queued', 'running', 'waiting_approval')`,
+    [projectId],
+  );
+  const activeIssueIds = new Set(activeRows.map((row) => row.linear_issue_id));
+  const selection = selectTodoExecutionTargets(issues, activeIssueIds, executeCap(env));
+
+  const runs: TodoExecutionRun[] = [];
+  const failedRuns: TodoExecutionResult["failedRuns"] = [];
+  for (const issue of selection.targets) {
+    try {
+      const run = await createAutonomousRun(env, user, {
+        objective: `${issue.title}\n\n${issue.description ?? ""}`.trim(),
+        linearProjectId: projectId,
+        linearIssueId: issue.id,
+        linearTeamId: issue.teamId ?? undefined,
+        agentProvider: options.agentProvider ?? "claude-code",
+        autonomyMode: "auto_eligible",
+        source: "manual-todo-refresh",
+      });
+      runs.push({ id: run.id, issue: issue.identifier, status: run.status });
+    } catch (err) {
+      failedRuns.push({
+        issue: issue.identifier,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return Response.json({
+    totalOpenIssues: issues.length,
+    eligibleIssues: selection.eligibleIssues,
+    runs,
+    skippedActive: selection.skippedActive,
+    skippedState: selection.skippedState,
+    skippedCap: selection.skippedCap,
+    failedRuns,
+  } satisfies TodoExecutionResult);
 }
 
 export async function continueProject(
@@ -161,4 +294,13 @@ export function executeCap(env: Env): number {
   const n = Number.parseInt(env.CONTINUE_EXECUTE_CAP ?? "", 10);
   const cap = Number.isInteger(n) && n > 0 ? n : DEFAULT_EXECUTE_CAP;
   return Math.min(cap, MAX_EXECUTE_CAP);
+}
+
+function priorityRank(priority: number): number {
+  return priority > 0 ? priority : Number.MAX_SAFE_INTEGER;
+}
+
+function updatedAtMs(updatedAt: string | null): number {
+  const ms = updatedAt ? Date.parse(updatedAt) : Number.NaN;
+  return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
 }

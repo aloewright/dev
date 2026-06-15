@@ -110,3 +110,13 @@ export type ContinueResult = {
   queuedRuns: Array<{ id: string; issue: string }>;
   skipped: number;
 };
+
+export type TodoExecutionResult = {
+  totalOpenIssues: number;
+  eligibleIssues: number;
+  runs: Array<{ id: string; issue: string; status: string }>;
+  skippedActive: number;
+  skippedState: number;
+  skippedCap: number;
+  failedRuns: Array<{ issue: string; error: string }>;
+};
